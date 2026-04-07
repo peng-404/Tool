@@ -721,10 +721,31 @@ function Stop-TargetProcessIfNeeded {
         return
     }
 
-    $processName = [System.IO.Path]::GetFileNameWithoutExtension($Candidate.Path)
-    if ($processName) {
-        Stop-Process -Name $processName -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 150
+    $processName = [System.IO.Path]::GetFileName($Candidate.Path)
+    $normalizedTargetPath = Get-NormalizedPath -Path $Candidate.Path
+    if (-not $processName -or -not $normalizedTargetPath) {
+        return
+    }
+
+    try {
+        $escapedProcessName = $processName.Replace("'", "''")
+        $matchingProcesses = Get-CimInstance Win32_Process -Filter "Name = '$escapedProcessName'" -ErrorAction Stop
+    } catch {
+        return
+    }
+
+    foreach ($process in $matchingProcesses) {
+        $processPath = Get-NormalizedPath -Path $process.ExecutablePath
+        if (-not $processPath -or $processPath -ne $normalizedTargetPath) {
+            continue
+        }
+
+        try {
+            Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+            Start-Sleep -Milliseconds 150
+        } catch {
+            continue
+        }
     }
 }
 
@@ -1334,31 +1355,31 @@ $btnPhase1.Add_Click({
         Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Preparing phase one..." -Mode Step -Current 0 -Maximum $phase1TotalSteps
         Write-UiLog -LogBox $logBox -Message "Phase one started: running system cleanup and collecting candidate items."
 
-        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 1/$phase1TotalSteps: running DISM cleanup..." -Mode Marquee
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 1/${phase1TotalSteps}: running DISM cleanup..." -Mode Marquee
         Wait-ExternalProcess -FilePath "dism.exe" -ArgumentList "/Online /Cleanup-Image /StartComponentCleanup" -LogBox $logBox -StartMessage "Running DISM to clean WinSxS components and update residue. This may take several minutes." -EndMessage "DISM finished." -ContinueOnError $true
         Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 1/$phase1TotalSteps complete: DISM finished." -Mode Step -Current 1 -Maximum $phase1TotalSteps
 
-        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 2/$phase1TotalSteps: running Disk Cleanup..." -Mode Marquee
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 2/${phase1TotalSteps}: running Disk Cleanup..." -Mode Marquee
         Wait-ExternalProcess -FilePath "cleanmgr.exe" -ArgumentList "/d c /VERYLOWDISK" -LogBox $logBox -StartMessage "Running cleanmgr for system disk cleanup." -EndMessage "Disk Cleanup finished." -ContinueOnError $true
         Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 2/$phase1TotalSteps complete: Disk Cleanup finished." -Mode Step -Current 2 -Maximum $phase1TotalSteps
 
         Write-UiLog -LogBox $logBox -Message "Scanning third-party startup items."
-        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 3/$phase1TotalSteps: scanning startup items..." -Mode Marquee
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 3/${phase1TotalSteps}: scanning startup items..." -Mode Marquee
         $startupCandidates = Get-StartupCandidateRecords
         Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 3/$phase1TotalSteps complete: found $($startupCandidates.Count) startup candidate(s)." -Mode Step -Current 3 -Maximum $phase1TotalSteps
 
         Write-UiLog -LogBox $logBox -Message "Scanning app caches and developer caches."
-        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 4/$phase1TotalSteps: scanning app and developer caches..." -Mode Marquee
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 4/${phase1TotalSteps}: scanning app and developer caches..." -Mode Marquee
         $cacheCandidates = Get-CacheCandidateRecords
         Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 4/$phase1TotalSteps complete: found $($cacheCandidates.Count) cache candidate(s)." -Mode Step -Current 4 -Maximum $phase1TotalSteps
 
         Write-UiLog -LogBox $logBox -Message "Scanning inactive installers and large files in Downloads, Desktop, and Documents."
-        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 5/$phase1TotalSteps: scanning inactive files..." -Mode Marquee
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 5/${phase1TotalSteps}: scanning inactive files..." -Mode Marquee
         $inactiveFileCandidates = Get-InactiveFileCandidateRecords -InactiveDays 180
         Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 5/$phase1TotalSteps complete: found $($inactiveFileCandidates.Count) inactive file candidate(s)." -Mode Step -Current 5 -Maximum $phase1TotalSteps
 
         $allCandidates = Merge-CandidateRecords -Candidates ($startupCandidates + $cacheCandidates + $inactiveFileCandidates)
-        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 6/$phase1TotalSteps: creating review file and metadata..." -Mode Marquee
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 6/${phase1TotalSteps}: creating review file and metadata..." -Mode Marquee
         $artifactInfo = Save-ReviewArtifacts -Candidates $allCandidates
 
         Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Complete" -ActivityText "Review list created with $($artifactInfo.SafeCandidates.Count) candidate(s)." -Mode Idle
