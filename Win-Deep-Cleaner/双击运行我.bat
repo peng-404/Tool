@@ -1,9 +1,14 @@
 @echo off
-title Windows Deep Cleaner Launcher
+title Win Deep Cleaner Launcher
 echo ========================================
-echo Starting Windows Deep Cleaner...
-echo Requesting Admin rights and bypassing policy...
+echo Starting Win Deep Cleaner...
+echo Launching PowerShell script...
 echo ========================================
 echo.
-powershell -Command "Start-Process PowerShell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File "%~dp0Win-Deep-Cleaner.ps1"' -Verb RunAs"
-pause
+set "SCRIPT_PATH=%~dp0Win-Deep-Cleaner.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_PATH%"
+if errorlevel 1 (
+    echo.
+    echo Win Deep Cleaner failed to start correctly.
+    pause
+)

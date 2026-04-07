@@ -1,175 +1,1470 @@
 # ==========================================
 # 0. Elevate Privileges (Admin rights required)
 # ==========================================
-if (-Not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Start-Process PowerShell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
-    Exit
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    try {
+        Start-Process "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs -ErrorAction Stop
+        exit
+    } catch {
+        Write-Host "Win Deep Cleaner requires administrator privileges. Please relaunch it and approve the UAC prompt." -ForegroundColor Yellow
+        exit 1
+    }
 }
 
-# Load .NET Forms Assembly
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName Microsoft.VisualBasic
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-# ==========================================
-# Phase 1: System Native Cleanup (Safest foundation)
-# ==========================================
-Clear-Host
-Write-Host "--- Starting Phase 1: System Native Optimization ---" -ForegroundColor Cyan
-Write-Host ">> Cleaning WinSxS components and update residues, please wait (may take several minutes)..." -ForegroundColor Gray
-Start-Process "dism.exe" "/Online /Cleanup-Image /StartComponentCleanup" -Wait -NoNewWindow
-Start-Process "cleanmgr.exe" "/d c /VERYLOWDISK" -Wait -NoNewWindow
+$script:DesktopPath = [Environment]::GetFolderPath("Desktop")
+$script:ReviewFilePath = Join-Path $script:DesktopPath "AI-Review-List.txt"
+$script:ManifestPath = Join-Path $script:DesktopPath "AI-Review-Metadata.json"
+$script:ReportRoot = Join-Path $script:DesktopPath "Win-Deep-Cleaner-Reports"
+$script:BackupRoot = Join-Path $script:DesktopPath "Win-Deep-Cleaner-Backups"
 
-# ==========================================
-# Phase 2: Full-Scope Path Scanning
-# ==========================================
-Write-Host ">> Scanning third-party startups and deep hidden caches..." -ForegroundColor Gray
-$startupList = @()
-$cacheList = @()
+$script:AccentColor = [System.Drawing.Color]::FromArgb(34, 87, 74)
+$script:DangerColor = [System.Drawing.Color]::FromArgb(136, 32, 32)
+$script:CanvasColor = [System.Drawing.Color]::FromArgb(245, 240, 231)
+$script:CardColor = [System.Drawing.Color]::FromArgb(255, 251, 245)
+$script:TextColor = [System.Drawing.Color]::FromArgb(36, 36, 36)
+$script:MutedColor = [System.Drawing.Color]::FromArgb(106, 96, 84)
 
-# 1. Scan startup items (Capture: rogue software, popup viruses, bundled programs)
-$startupItems = Get-CimInstance Win32_StartupCommand
-$regex = '(?i)([a-z]:\\[^\*?"<>\|]+\.(?:exe|bat|cmd|vbs|dll|ps1))'
-foreach ($item in $startupItems) {
-    if ($item.Command -match $regex) {
-        $path = $matches[1]
-        # Exclude Microsoft native core paths
-        if (($path -notmatch "(?i)^C:\\Windows\\") -and (Test-Path $path)) { $startupList += $path }
+function Write-UiLog {
+    param(
+        [System.Windows.Forms.TextBox]$LogBox,
+        [string]$Message
+    )
+
+    if (-not $LogBox) {
+        return
+    }
+
+    $timestamp = Get-Date -Format "HH:mm:ss"
+    $LogBox.AppendText("[$timestamp] $Message`r`n")
+    $LogBox.SelectionStart = $LogBox.TextLength
+    $LogBox.ScrollToCaret()
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Set-TaggedControlsState {
+    param(
+        [System.Windows.Forms.Control]$Parent,
+        [bool]$Enabled
+    )
+
+    foreach ($child in $Parent.Controls) {
+        if ($child.Tag -eq "action-button") {
+            $child.Enabled = $Enabled
+        }
+
+        if ($child.Controls.Count -gt 0) {
+            Set-TaggedControlsState -Parent $child -Enabled $Enabled
+        }
     }
 }
 
-# 2. Scan common and developer environment caches
-$cachePaths = @(
-    # --- Common Software Caches ---
-    "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Cache\Cache_Data", 
-    "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Cache\Cache_Data", 
-    "$env:USERPROFILE\Documents\WeChat Files\Applet",                      
-    "$env:USERPROFILE\Documents\WeChat Files\FileStorage\Cache",          
-    "$env:APPDATA\Tencent\QQ\Temp",                                        
-    "$env:TEMP",                                                           
-    # --- Developer Environment ---
-    "$env:USERPROFILE\.cache\huggingface", "$env:USERPROFILE\.cache\torch", 
-    "$env:LOCALAPPDATA\pip\Cache", "$env:USERPROFILE\.conda\pkgs",
-    "$env:APPDATA\Obsidian\Cache", "$env:LOCALAPPDATA\npm-cache"
-)
-foreach ($cp in $cachePaths) { if (Test-Path $cp) { $cacheList += $cp } }
+function Set-UiBusyState {
+    param(
+        [System.Windows.Forms.Form]$Form,
+        [bool]$IsBusy
+    )
 
-# ==========================================
-# Phase 3: Generate AI Review TXT
-# ==========================================
-$txtPath = "$env:USERPROFILE\Desktop\AI-Review-List.txt"
-$header = @"
-# === Windows Deep Clean AI Review List ===
-# Instructions:
-# 1. Copy all content below to a large language model (e.g., Gemini, ChatGPT, etc.).
-# 2. Paste the AI-filtered [pure path list] back into this file.
-# 3. Save (Ctrl+S) and close Notepad, the script will proceed to final confirmation.
+    $Form.UseWaitCursor = $IsBusy
+    Set-TaggedControlsState -Parent $Form -Enabled (-not $IsBusy)
+    [System.Windows.Forms.Application]::DoEvents()
+}
 
-[SECTION_STARTUP_ITEMS] (Suspected rogue software/viruses/adware)
-"@
-$header | Out-File -FilePath $txtPath -Encoding UTF8
-($startupList | Select-Object -Unique) | Out-File -FilePath $txtPath -Append -Encoding UTF8
+function Set-ProgressState {
+    param(
+        [System.Windows.Forms.ProgressBar]$ProgressBar,
+        [System.Windows.Forms.Label]$StatusLabel,
+        [System.Windows.Forms.Label]$ActivityLabel,
+        [string]$StatusText,
+        [string]$ActivityText,
+        [ValidateSet("Idle", "Marquee", "Step")] [string]$Mode = "Idle",
+        [int]$Current = 0,
+        [int]$Maximum = 1
+    )
 
-"`n[SECTION_APP_CACHES] (High-frequency app and environment redundant caches)" | Out-File -FilePath $txtPath -Append -Encoding UTF8
-($cacheList | Select-Object -Unique) | Out-File -FilePath $txtPath -Append -Encoding UTF8
-
-# ==========================================
-# Phase 4: Interactive Prompt and AI Integration
-# ==========================================
-$msg = "[AI Assisted Decision Phase]`n`n1. 'AI-Review-List.txt' has been generated on desktop.`n2. Copy its content to an AI model for diagnosis.`n3. Paste confirmed junk/rogue paths back and save.`n`nAfter closing Notepad, the final verification window will appear!"
-[System.Windows.Forms.MessageBox]::Show($msg, "Anti-Mistake Review", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-
-Start-Process "notepad.exe" -ArgumentList $txtPath -Wait
-
-# ==========================================
-# Phase 5: Read AI Results and Visual Final Confirmation
-# ==========================================
-if (Test-Path $txtPath) {
-    $finalDeleteList = Get-Content $txtPath | Where-Object { $_.Trim() -ne "" -and $_ -notmatch "^#" -and $_ -notmatch "\[SECTION_" }
-    
-    if ($finalDeleteList.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("No valid paths in the list, operation cancelled.", "Notice")
-        Remove-Item $txtPath -Force
-        Exit
+    if ($StatusLabel) {
+        $StatusLabel.Text = $StatusText
     }
 
-    $confirmForm = New-Object System.Windows.Forms.Form
-    $confirmForm.Text = "Final Check: Items to be shredded"
-    $confirmForm.Size = New-Object System.Drawing.Size(700, 500)
-    $confirmForm.StartPosition = "CenterScreen"
-    $confirmForm.FormBorderStyle = "FixedDialog"
-    $confirmForm.MaximizeBox = $false
+    if ($ActivityLabel) {
+        $ActivityLabel.Text = $ActivityText
+    }
 
-    $cLabel = New-Object System.Windows.Forms.Label
-    $cLabel.Text = "⚠️ Please final confirm the following $($finalDeleteList.Count) targets. Once you click [Start Shredding], files cannot be recovered!"
-    $cLabel.Location = New-Object System.Drawing.Point(20, 15)
-    $cLabel.Size = New-Object System.Drawing.Size(650, 30)
-    $cLabel.ForeColor = [System.Drawing.Color]::Red
-    $cLabel.Font = New-Object System.Drawing.Font("Microsoft YaHei", 10, [System.Drawing.FontStyle]::Bold)
-    $confirmForm.Controls.Add($cLabel)
+    if ($ProgressBar) {
+        switch ($Mode) {
+            "Marquee" {
+                $ProgressBar.Style = "Marquee"
+                $ProgressBar.MarqueeAnimationSpeed = 25
+            }
+            "Step" {
+                if ($Maximum -lt 1) {
+                    $Maximum = 1
+                }
 
-    $listBox = New-Object System.Windows.Forms.ListBox
-    $listBox.Location = New-Object System.Drawing.Point(20, 50)
-    $listBox.Size = New-Object System.Drawing.Size(640, 320)
-    $listBox.Font = New-Object System.Drawing.Font("Consolas", 9)
-    foreach ($line in $finalDeleteList) { $listBox.Items.Add($line) | Out-Null }
-    $confirmForm.Controls.Add($listBox)
+                $ProgressBar.Style = "Continuous"
+                $ProgressBar.MarqueeAnimationSpeed = 0
+                $ProgressBar.Value = 0
+                $ProgressBar.Maximum = $Maximum
+                $ProgressBar.Value = [Math]::Min([Math]::Max($Current, 0), $Maximum)
+            }
+            default {
+                $ProgressBar.Style = "Continuous"
+                $ProgressBar.MarqueeAnimationSpeed = 0
+                $ProgressBar.Value = 0
+                $ProgressBar.Maximum = 1
+            }
+        }
+    }
 
-    $btnFinal = New-Object System.Windows.Forms.Button
-    $btnFinal.Text = "⚡ Confirm and Start Shredding"
-    $btnFinal.Location = New-Object System.Drawing.Point(250, 390)
-    $btnFinal.Size = New-Object System.Drawing.Size(200, 45)
-    $btnFinal.BackColor = [System.Drawing.Color]::DarkRed
-    $btnFinal.ForeColor = [System.Drawing.Color]::White
-    $btnFinal.Font = New-Object System.Drawing.Font("Microsoft YaHei", 10, [System.Drawing.FontStyle]::Bold)
+    [System.Windows.Forms.Application]::DoEvents()
+}
 
-    $isConfirmed = $false
-    $btnFinal.Add_Click({
-        $script:isConfirmed = $true
-        $confirmForm.Close()
-    })
-    $confirmForm.Controls.Add($btnFinal)
+function Ensure-Directory {
+    param([string]$Path)
 
-    $confirmForm.ShowDialog() | Out-Null
+    if (-not (Test-Path -LiteralPath $Path)) {
+        [void](New-Item -ItemType Directory -Path $Path -Force)
+    }
+}
 
-    # ==========================================
-    # Phase 6: Execute Final Shredding (with progress bar)
-    # ==========================================
-    if ($isConfirmed) {
-        Write-Host "`n[!] Executing ultimate shredding process..." -ForegroundColor Red
-        $successCount = 0
-        $totalItems = $finalDeleteList.Count
-        $currentIndex = 0
+function Get-NormalizedPath {
+    param([string]$Path)
 
-        foreach ($target in $finalDeleteList) {
-            $target = $target.Trim()
-            $currentIndex++
-            
-            if (Test-Path $target) {
-                $percent = [math]::Round(($currentIndex / $totalItems) * 100)
-                $name = [System.IO.Path]::GetFileName($target)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $null
+    }
 
-                Write-Progress -Activity "⚡ Ultimate Shredding in Progress" -Status "Shredding [$currentIndex/$totalItems]: $name" -PercentComplete $percent -CurrentOperation "Overall Progress: $percent%"
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($Path)
+    } catch {
+        $fullPath = $Path
+    }
 
-                try {
-                    $processName = [System.IO.Path]::GetFileNameWithoutExtension($target)
-                    Stop-Process -Name $processName -Force -ErrorAction SilentlyContinue
-                    Start-Sleep -Milliseconds 200
-                    
-                    Remove-Item -Path $target -Force -Recurse -ErrorAction SilentlyContinue
-                    $successCount++
-                    Write-Host " [Success] Shredded: $target" -ForegroundColor DarkGray
-                } catch {
-                    Write-Host " [Skipped] Cannot delete (may be system locked): $target" -ForegroundColor Yellow
+    return $fullPath.Trim().TrimEnd('\').ToLowerInvariant()
+}
+
+function Get-PathGuard {
+    param([string]$Path)
+
+    $normalized = Get-NormalizedPath -Path $Path
+    if (-not $normalized) {
+        return [pscustomobject]@{
+            Blocked = $true
+            Reason = "Path is empty or invalid"
+        }
+    }
+
+    $systemDriveRoot = Get-NormalizedPath -Path "$env:SystemDrive\"
+    $windowsRoot = Get-NormalizedPath -Path $env:windir
+    $driverRoots = @(
+        (Join-Path $env:windir "System32\drivers"),
+        (Join-Path $env:windir "System32\DriverStore"),
+        (Join-Path $env:SystemDrive "Drivers")
+    ) | ForEach-Object { Get-NormalizedPath -Path $_ }
+
+    $otherProtectedRoots = @(
+        (Join-Path $env:SystemDrive "System Volume Information"),
+        (Join-Path $env:SystemDrive '$Recycle.Bin'),
+        (Join-Path $env:ProgramData "Microsoft\Windows")
+    ) | Where-Object { $_ } | ForEach-Object { Get-NormalizedPath -Path $_ }
+
+    if ($normalized -eq (Get-NormalizedPath -Path $env:SystemDrive)) {
+        return [pscustomobject]@{
+            Blocked = $true
+            Reason = "System drive root is blocked"
+        }
+    }
+
+    if ($normalized -eq $systemDriveRoot.TrimEnd('\').ToLowerInvariant()) {
+        return [pscustomobject]@{
+            Blocked = $true
+            Reason = "System drive root is blocked"
+        }
+    }
+
+    if ($normalized -eq $windowsRoot -or $normalized.StartsWith("$windowsRoot\")) {
+        return [pscustomobject]@{
+            Blocked = $true
+            Reason = "Windows system directory is blocked"
+        }
+    }
+
+    foreach ($driverRoot in $driverRoots) {
+        if ($driverRoot -and ($normalized -eq $driverRoot -or $normalized.StartsWith("$driverRoot\"))) {
+            return [pscustomobject]@{
+                Blocked = $true
+                Reason = "Driver-related directory is blocked"
+            }
+        }
+    }
+
+    foreach ($protectedRoot in $otherProtectedRoots) {
+        if ($protectedRoot -and ($normalized -eq $protectedRoot -or $normalized.StartsWith("$protectedRoot\"))) {
+            return [pscustomobject]@{
+                Blocked = $true
+                Reason = "Protected system directory is blocked"
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Blocked = $false
+        Reason = ""
+    }
+}
+
+function Get-PathFromLine {
+    param([string]$Line)
+
+    if ([string]::IsNullOrWhiteSpace($Line)) {
+        return $null
+    }
+
+    $cleaned = $Line.Trim()
+    $cleaned = $cleaned -replace '^[\-\*\u2022]+\s*', ''
+    $cleaned = $cleaned -replace '^\d+[\.\)]\s*', ''
+    $cleaned = $cleaned.Trim('"', "'", '“', '”', '‘', '’', '`')
+
+    if ($cleaned -match '(?i)([a-z]:\\.*)$') {
+        $path = $matches[1].Trim()
+        $path = $path.Trim('"', "'", '“', '”', '‘', '’', '`')
+        $path = $path -replace '["''“”‘’`]+$', ''
+        $path = $path -replace '[,，;；。]+$', ''
+        return $path
+    }
+
+    return $null
+}
+
+function Format-Bytes {
+    param([nullable[long]]$Bytes)
+
+    if (-not $Bytes -or $Bytes -le 0) {
+        return "-"
+    }
+
+    $size = [double]$Bytes
+    $units = @("B", "KB", "MB", "GB", "TB")
+    $unitIndex = 0
+    while ($size -ge 1024 -and $unitIndex -lt ($units.Count - 1)) {
+        $size = $size / 1024
+        $unitIndex++
+    }
+
+    return "{0:N1} {1}" -f $size, $units[$unitIndex]
+}
+
+function Get-ShortDisplayPath {
+    param(
+        [string]$Path,
+        [int]$MaxLength = 72
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path.Length -le $MaxLength) {
+        return $Path
+    }
+
+    $tailLength = [Math]::Max(20, $MaxLength - 4)
+    return "...\" + $Path.Substring($Path.Length - $tailLength)
+}
+
+function Format-DateValue {
+    param([Nullable[datetime]]$Value)
+
+    if (-not $Value) {
+        return "-"
+    }
+
+    return $Value.ToString("yyyy-MM-dd")
+}
+
+function Get-LastActivityTime {
+    param($Item)
+
+    if (-not $Item) {
+        return $null
+    }
+
+    $lastWrite = $Item.LastWriteTime
+    $lastAccess = $Item.LastAccessTime
+
+    if ($lastAccess -and $lastAccess -gt $lastWrite) {
+        return $lastAccess
+    }
+
+    return $lastWrite
+}
+
+function Get-ItemKindLabel {
+    param($Item)
+
+    if (-not $Item) {
+        return "Unknown"
+    }
+
+    if ($Item.PSIsContainer) {
+        return "Folder"
+    }
+
+    return "File"
+}
+
+function Get-FileSizeIfAvailable {
+    param($Item)
+
+    if ($Item -and (-not $Item.PSIsContainer)) {
+        return [long]$Item.Length
+    }
+
+    return $null
+}
+
+function New-CandidateRecord {
+    param(
+        [string]$Path,
+        [string]$CategoryLabel,
+        [string]$SourceLabel,
+        [string]$Reason
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item) {
+        return $null
+    }
+
+    $guard = Get-PathGuard -Path $item.FullName
+    $lastActivity = Get-LastActivityTime -Item $item
+
+    return [pscustomobject]@{
+        Id = [guid]::NewGuid().Guid
+        Path = $item.FullName
+        NormalizedPath = Get-NormalizedPath -Path $item.FullName
+        CategoryLabel = $CategoryLabel
+        SourceLabel = $SourceLabel
+        Reason = $Reason
+        ItemKind = Get-ItemKindLabel -Item $item
+        SizeBytes = Get-FileSizeIfAvailable -Item $item
+        LastActivity = $lastActivity
+        LastWriteTime = $item.LastWriteTime
+        ExistsNow = $true
+        Blocked = $guard.Blocked
+        BlockReason = $guard.Reason
+        SelectedByDefault = (-not $guard.Blocked)
+    }
+}
+
+function Merge-CandidateRecords {
+    param([object[]]$Candidates)
+
+    $map = @{}
+    foreach ($candidate in $Candidates) {
+        if (-not $candidate) {
+            continue
+        }
+
+        $key = $candidate.NormalizedPath
+        if (-not $key) {
+            continue
+        }
+
+        if ($map.ContainsKey($key)) {
+            $existing = $map[$key]
+            $existing.SourceLabel = (($existing.SourceLabel -split ' / ') + ($candidate.SourceLabel -split ' / ') | Where-Object { $_ } | Select-Object -Unique) -join " / "
+            $existing.Reason = (($existing.Reason -split ' / ') + ($candidate.Reason -split ' / ') | Where-Object { $_ } | Select-Object -Unique) -join " / "
+            if (($candidate.LastActivity -and -not $existing.LastActivity) -or ($candidate.LastActivity -and $existing.LastActivity -and $candidate.LastActivity -gt $existing.LastActivity)) {
+                $existing.LastActivity = $candidate.LastActivity
+            }
+            if (-not $existing.SizeBytes -and $candidate.SizeBytes) {
+                $existing.SizeBytes = $candidate.SizeBytes
+            }
+            $existing.Blocked = $existing.Blocked -or $candidate.Blocked
+            if ($candidate.BlockReason) {
+                $existing.BlockReason = (($existing.BlockReason -split ' / ') + ($candidate.BlockReason -split ' / ') | Where-Object { $_ } | Select-Object -Unique) -join " / "
+            }
+        } else {
+            $map[$key] = $candidate
+        }
+    }
+
+    return $map.Values | Sort-Object CategoryLabel, SourceLabel, Path
+}
+
+function Get-StartupCandidateRecords {
+    $records = @()
+    $regex = '(?i)([a-z]:\\[^\*?"<>\|]+\.(?:exe|bat|cmd|vbs|dll|ps1))'
+
+    try {
+        $startupItems = Get-CimInstance Win32_StartupCommand
+        foreach ($item in $startupItems) {
+            if ($item.Command -match $regex) {
+                $record = New-CandidateRecord -Path $matches[1] -CategoryLabel "Startup Item" -SourceLabel "Third-party Startup Entry" -Reason "Detected from the system startup command list"
+                if ($record) {
+                    $records += $record
                 }
             }
         }
-        
-        Write-Progress -Activity "⚡ Ultimate Shredding in Progress" -Completed
-        Remove-Item $txtPath -Force
-        [System.Windows.Forms.MessageBox]::Show("System cleanup completed successfully!`nSuccessfully shredded $successCount redundant/rogue targets.", "Task Completed", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-    } else {
-        [System.Windows.Forms.MessageBox]::Show("Operation cancelled, no verified files were deleted.", "Terminated")
-        Remove-Item $txtPath -Force
+    } catch {
+        throw "Failed to read startup items: $($_.Exception.Message)"
+    }
+
+    return $records
+}
+
+function Get-CacheCandidateRecords {
+    $definitions = @(
+        @{ Path = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Cache\Cache_Data"; Category = "App Cache"; Source = "Edge Browser Cache"; Reason = "Default browser cache directory" },
+        @{ Path = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Cache\Cache_Data"; Category = "App Cache"; Source = "Chrome Browser Cache"; Reason = "Default browser cache directory" },
+        @{ Path = "$env:USERPROFILE\Documents\WeChat Files\Applet"; Category = "App Cache"; Source = "WeChat Mini Program Cache"; Reason = "Applet cache inside the WeChat files directory" },
+        @{ Path = "$env:USERPROFILE\Documents\WeChat Files\FileStorage\Cache"; Category = "App Cache"; Source = "WeChat File Cache"; Reason = "WeChat FileStorage cache directory" },
+        @{ Path = "$env:APPDATA\Tencent\QQ\Temp"; Category = "App Cache"; Source = "QQ Temporary Files"; Reason = "QQ temporary directory" },
+        @{ Path = "$env:TEMP"; Category = "App Cache"; Source = "System Temporary Directory"; Reason = "Current user's temp directory" },
+        @{ Path = "$env:USERPROFILE\.cache\huggingface"; Category = "Dev Cache"; Source = "HuggingFace Cache"; Reason = "Model download cache directory" },
+        @{ Path = "$env:USERPROFILE\.cache\torch"; Category = "Dev Cache"; Source = "PyTorch Cache"; Reason = "Torch default cache directory" },
+        @{ Path = "$env:LOCALAPPDATA\pip\Cache"; Category = "Dev Cache"; Source = "pip Cache"; Reason = "pip package cache directory" },
+        @{ Path = "$env:USERPROFILE\.conda\pkgs"; Category = "Dev Cache"; Source = "Conda Package Cache"; Reason = "Conda pkgs cache directory" },
+        @{ Path = "$env:APPDATA\Obsidian\Cache"; Category = "App Cache"; Source = "Obsidian Cache"; Reason = "Obsidian cache directory" },
+        @{ Path = "$env:LOCALAPPDATA\npm-cache"; Category = "Dev Cache"; Source = "npm Cache"; Reason = "npm default cache directory" }
+    )
+
+    $records = @()
+    foreach ($definition in $definitions) {
+        $record = New-CandidateRecord -Path $definition.Path -CategoryLabel $definition.Category -SourceLabel $definition.Source -Reason $definition.Reason
+        if ($record) {
+            $records += $record
+        }
+    }
+
+    return $records
+}
+
+function Get-InactiveFileCandidateRecords {
+    param([int]$InactiveDays = 180)
+
+    $cutoff = (Get-Date).AddDays(-$InactiveDays)
+    $archiveExtensions = @(".zip", ".rar", ".7z", ".iso", ".msi", ".exe", ".cab", ".dmp", ".log")
+    $definitions = @(
+        @{ Root = (Join-Path $env:USERPROFILE "Downloads"); Category = "Inactive Files"; Source = "Old Installers / Archives in Downloads"; MinSizeBytes = 50MB; Extensions = $archiveExtensions },
+        @{ Root = (Join-Path $env:USERPROFILE "Desktop"); Category = "Inactive Files"; Source = "Old Installers / Large Files on Desktop"; MinSizeBytes = 100MB; Extensions = $archiveExtensions },
+        @{ Root = (Join-Path $env:USERPROFILE "Documents"); Category = "Inactive Files"; Source = "Old Installers / Archives in Documents"; MinSizeBytes = 20MB; Extensions = $archiveExtensions }
+    )
+
+    $records = @()
+    foreach ($definition in $definitions) {
+        if (-not (Test-Path -LiteralPath $definition.Root)) {
+            continue
+        }
+
+        try {
+            $files = Get-ChildItem -LiteralPath $definition.Root -Force -File -ErrorAction Stop
+        } catch {
+            continue
+        }
+
+        foreach ($file in $files) {
+            $lastActivity = Get-LastActivityTime -Item $file
+            $extension = $file.Extension.ToLowerInvariant()
+            $isInterestingExtension = $definition.Extensions -contains $extension
+            $isLargeFile = $file.Length -ge $definition.MinSizeBytes
+
+            if ($lastActivity -le $cutoff -and ($isInterestingExtension -or $isLargeFile)) {
+                $reason = "Top-level file inactive for six months, last activity $(Format-DateValue -Value $lastActivity)"
+                $record = New-CandidateRecord -Path $file.FullName -CategoryLabel $definition.Category -SourceLabel $definition.Source -Reason $reason
+                if ($record) {
+                    $records += $record
+                }
+            }
+        }
+    }
+
+    return $records
+}
+
+function Wait-ExternalProcess {
+    param(
+        [string]$FilePath,
+        [string]$ArgumentList,
+        [System.Windows.Forms.TextBox]$LogBox,
+        [string]$StartMessage,
+        [string]$EndMessage,
+        [bool]$ContinueOnError = $false
+    )
+
+    try {
+        Write-UiLog -LogBox $LogBox -Message $StartMessage
+        $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru -WindowStyle Normal -ErrorAction Stop
+
+        while (-not $process.HasExited) {
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 250
+        }
+
+        if ($process.ExitCode -ne 0) {
+            $message = "$EndMessage Exit code: $($process.ExitCode)"
+            if ($ContinueOnError) {
+                Write-UiLog -LogBox $LogBox -Message "Warning: $message"
+                return $process.ExitCode
+            }
+
+            throw "$FilePath failed with exit code $($process.ExitCode)"
+        }
+
+        Write-UiLog -LogBox $LogBox -Message $EndMessage
+        return $process.ExitCode
+    } catch {
+        if ($ContinueOnError) {
+            Write-UiLog -LogBox $LogBox -Message "Warning: $FilePath failed, but the program will continue. $($_.Exception.Message)"
+            return $null
+        }
+
+        throw
     }
 }
+
+function Save-ReviewArtifacts {
+    param([object[]]$Candidates)
+
+    $safeCandidates = @($Candidates | Where-Object { -not $_.Blocked })
+    $blockedCandidates = @($Candidates | Where-Object { $_.Blocked })
+
+    $header = @(
+        "# === Windows Deep Clean AI Review List ==="
+        "# This is the candidate list generated in phase one. You can send it to an AI model or review it manually."
+        "# Phase two will show a checkbox-based confirmation screen. Only checked and confirmed items will be processed."
+        "# You can delete lines you do not want, or keep the full tagged line."
+        "# Phase two automatically extracts the path at the end of each line."
+        "#"
+        "# Auto-blocked high-risk paths: $($blockedCandidates.Count)"
+        "# They will not be processed in phase two."
+        ""
+    )
+
+    $header | Out-File -FilePath $script:ReviewFilePath -Encoding UTF8
+
+    foreach ($group in ($safeCandidates | Group-Object CategoryLabel)) {
+        "[SECTION_$($group.Name)]" | Out-File -FilePath $script:ReviewFilePath -Append -Encoding UTF8
+        foreach ($candidate in $group.Group) {
+            $line = "[Source: $($candidate.SourceLabel)] [Type: $($candidate.ItemKind)] [Last Activity: $(Format-DateValue -Value $candidate.LastActivity)] [Size: $(Format-Bytes -Bytes $candidate.SizeBytes)] $($candidate.Path)"
+            $line | Out-File -FilePath $script:ReviewFilePath -Append -Encoding UTF8
+        }
+        "" | Out-File -FilePath $script:ReviewFilePath -Append -Encoding UTF8
+    }
+
+    $manifest = [pscustomobject]@{
+        CreatedAt = (Get-Date).ToString("s")
+        ReviewFilePath = $script:ReviewFilePath
+        SafeCount = $safeCandidates.Count
+        BlockedCount = $blockedCandidates.Count
+        Candidates = $Candidates
+    }
+
+    $manifest | ConvertTo-Json -Depth 6 | Out-File -FilePath $script:ManifestPath -Encoding UTF8
+
+    return [pscustomobject]@{
+        SafeCandidates = $safeCandidates
+        BlockedCandidates = $blockedCandidates
+    }
+}
+
+function Load-CandidateManifest {
+    if (-not (Test-Path -LiteralPath $script:ManifestPath)) {
+        return @()
+    }
+
+    try {
+        $raw = Get-Content -LiteralPath $script:ManifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return @()
+    }
+
+    $items = @()
+    foreach ($candidate in $raw.Candidates) {
+        $items += [pscustomobject]@{
+            Id = $candidate.Id
+            Path = $candidate.Path
+            NormalizedPath = Get-NormalizedPath -Path $candidate.Path
+            CategoryLabel = $candidate.CategoryLabel
+            SourceLabel = $candidate.SourceLabel
+            Reason = $candidate.Reason
+            ItemKind = $candidate.ItemKind
+            SizeBytes = if ($candidate.SizeBytes) { [long]$candidate.SizeBytes } else { $null }
+            LastActivity = if ($candidate.LastActivity) { [datetime]$candidate.LastActivity } else { $null }
+            LastWriteTime = if ($candidate.LastWriteTime) { [datetime]$candidate.LastWriteTime } else { $null }
+            ExistsNow = Test-Path -LiteralPath $candidate.Path
+            Blocked = [bool]$candidate.Blocked
+            BlockReason = $candidate.BlockReason
+            SelectedByDefault = [bool]$candidate.SelectedByDefault
+        }
+    }
+
+    return $items
+}
+
+function Get-ReviewedPaths {
+    if (-not (Test-Path -LiteralPath $script:ReviewFilePath)) {
+        return @()
+    }
+
+    try {
+        $lines = Get-Content -LiteralPath $script:ReviewFilePath -ErrorAction Stop
+    } catch {
+        return @()
+    }
+
+    $paths = foreach ($line in $lines) {
+        $trimmed = $line.Trim()
+        if ($trimmed -and $trimmed -notmatch '^#' -and $trimmed -notmatch '^\[SECTION_') {
+            $path = Get-PathFromLine -Line $trimmed
+            if ($path) {
+                $path
+            }
+        }
+    }
+
+    return $paths | Select-Object -Unique
+}
+
+function New-AdHocReviewedCandidate {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [pscustomobject]@{
+            Id = [guid]::NewGuid().Guid
+            Path = $Path
+            NormalizedPath = Get-NormalizedPath -Path $Path
+            CategoryLabel = "User Added"
+            SourceLabel = "Path Added Manually"
+            Reason = "This path came from the review file but is not present in the phase-one metadata"
+            ItemKind = "Unknown"
+            SizeBytes = $null
+            LastActivity = $null
+            LastWriteTime = $null
+            ExistsNow = $false
+            Blocked = $false
+            BlockReason = ""
+            SelectedByDefault = $true
+        }
+    }
+
+    $record = New-CandidateRecord -Path $Path -CategoryLabel "User Added" -SourceLabel "Path Added Manually" -Reason "This path came from the review file but is not present in the phase-one metadata"
+    return $record
+}
+
+function Resolve-ReviewedCandidates {
+    param(
+        [string[]]$ReviewedPaths,
+        [object[]]$ManifestCandidates
+    )
+
+    $manifestMap = @{}
+    foreach ($candidate in $ManifestCandidates) {
+        if ($candidate.NormalizedPath) {
+            $manifestMap[$candidate.NormalizedPath] = $candidate
+        }
+    }
+
+    $resolved = @()
+    $blockedFromReview = @()
+
+    foreach ($path in ($ReviewedPaths | Select-Object -Unique)) {
+        $normalized = Get-NormalizedPath -Path $path
+        if (-not $normalized) {
+            continue
+        }
+
+        if ($manifestMap.ContainsKey($normalized)) {
+            $candidate = $manifestMap[$normalized]
+        } else {
+            $candidate = New-AdHocReviewedCandidate -Path $path
+        }
+
+        $guard = Get-PathGuard -Path $candidate.Path
+        $candidate.Blocked = $guard.Blocked
+        $candidate.BlockReason = $guard.Reason
+        $candidate.ExistsNow = Test-Path -LiteralPath $candidate.Path
+
+        if ($candidate.Blocked) {
+            $blockedFromReview += $candidate
+        } else {
+            $resolved += $candidate
+        }
+    }
+
+    return [pscustomobject]@{
+        Allowed = $resolved
+        Blocked = $blockedFromReview
+    }
+}
+
+function Stop-TargetProcessIfNeeded {
+    param([object]$Candidate)
+
+    if (-not $Candidate.ExistsNow) {
+        return
+    }
+
+    if ($Candidate.ItemKind -ne "File") {
+        return
+    }
+
+    $extension = [System.IO.Path]::GetExtension($Candidate.Path).ToLowerInvariant()
+    if ($extension -notin @(".exe", ".bat", ".cmd", ".ps1", ".vbs")) {
+        return
+    }
+
+    $processName = [System.IO.Path]::GetFileNameWithoutExtension($Candidate.Path)
+    if ($processName) {
+        Stop-Process -Name $processName -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 150
+    }
+}
+
+function Backup-Target {
+    param(
+        [object]$Candidate,
+        [string]$SessionBackupPath,
+        [int]$Index
+    )
+
+    $slot = Join-Path $SessionBackupPath ("item-{0:D3}" -f $Index)
+    Ensure-Directory -Path $slot
+    Copy-Item -LiteralPath $Candidate.Path -Destination $slot -Recurse -Force -ErrorAction Stop
+    return $slot
+}
+
+function Remove-TargetWithMode {
+    param(
+        [object]$Candidate,
+        [bool]$UseRecycleBin
+    )
+
+    $item = Get-Item -LiteralPath $Candidate.Path -Force -ErrorAction Stop
+    if ($UseRecycleBin) {
+        if ($item.PSIsContainer) {
+            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory(
+                $item.FullName,
+                [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+                [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
+            )
+        } else {
+            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
+                $item.FullName,
+                [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+                [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
+            )
+        }
+    } else {
+        Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
+    }
+}
+
+function Save-DeletionReport {
+    param(
+        [string]$SessionId,
+        [string]$ReviewSnapshotPath,
+        [string]$BackupPath,
+        [bool]$UseRecycleBin,
+        [object[]]$Entries,
+        [int]$BlockedCount
+    )
+
+    Ensure-Directory -Path $script:ReportRoot
+    $reportBase = Join-Path $script:ReportRoot ("Cleanup-Report-{0}" -f $SessionId)
+    $txtPath = "$reportBase.txt"
+    $jsonPath = "$reportBase.json"
+
+    $successCount = @($Entries | Where-Object { $_.Result -eq "Success" }).Count
+    $skippedCount = @($Entries | Where-Object { $_.Result -ne "Success" }).Count
+
+    $lines = @(
+        "Win Deep Cleaner Execution Report"
+        "Session: $SessionId"
+        "CreatedAt: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")"
+        "ReviewFile: $ReviewSnapshotPath"
+        "BackupPath: $(if ($BackupPath) { $BackupPath } else { '-' })"
+        "DeletionMode: $(if ($UseRecycleBin) { 'RecycleBin' } else { 'PermanentDelete' })"
+        "BlockedByGuard: $BlockedCount"
+        "SuccessCount: $successCount"
+        "SkippedCount: $skippedCount"
+        ""
+        "Details:"
+    )
+
+    foreach ($entry in $Entries) {
+        $lines += "[{0}] [{1}] [{2}] {3} | {4}" -f $entry.Result, $entry.SourceLabel, $entry.CategoryLabel, $entry.Path, $entry.Message
+    }
+
+    $lines | Out-File -FilePath $txtPath -Encoding UTF8
+
+    [pscustomobject]@{
+        SessionId = $SessionId
+        CreatedAt = (Get-Date).ToString("s")
+        ReviewFile = $ReviewSnapshotPath
+        BackupPath = $BackupPath
+        UseRecycleBin = $UseRecycleBin
+        BlockedByGuard = $BlockedCount
+        Entries = $Entries
+    } | ConvertTo-Json -Depth 6 | Out-File -FilePath $jsonPath -Encoding UTF8
+
+    return [pscustomobject]@{
+        TextPath = $txtPath
+        JsonPath = $jsonPath
+    }
+}
+
+function Show-ExecutionPlannerDialog {
+    param(
+        [object[]]$Candidates,
+        [object[]]$BlockedCandidates
+    )
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = "Phase Two: Review and Execute"
+    $dialog.StartPosition = "CenterParent"
+    $dialog.FormBorderStyle = "FixedDialog"
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.ClientSize = New-Object System.Drawing.Size(980, 640)
+    $dialog.BackColor = $script:CardColor
+    $dialog.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9)
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = "Phase Two Confirmation"
+    $title.Location = New-Object System.Drawing.Point(24, 18)
+    $title.Size = New-Object System.Drawing.Size(260, 28)
+    $title.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 15, [System.Drawing.FontStyle]::Bold)
+    $title.ForeColor = $script:DangerColor
+    $dialog.Controls.Add($title)
+
+    $summary = New-Object System.Windows.Forms.Label
+    $summary.Text = "These are the items you kept in the review file. You can uncheck any item here. High-risk paths are blocked automatically and will not be executed."
+    $summary.Location = New-Object System.Drawing.Point(24, 50)
+    $summary.Size = New-Object System.Drawing.Size(920, 24)
+    $summary.ForeColor = $script:TextColor
+    $dialog.Controls.Add($summary)
+
+    $listView = New-Object System.Windows.Forms.ListView
+    $listView.Location = New-Object System.Drawing.Point(24, 88)
+    $listView.Size = New-Object System.Drawing.Size(932, 390)
+    $listView.View = "Details"
+    $listView.CheckBoxes = $true
+    $listView.FullRowSelect = $true
+    $listView.GridLines = $true
+    $listView.HideSelection = $false
+    [void]$listView.Columns.Add("Source", 170)
+    [void]$listView.Columns.Add("Category", 110)
+    [void]$listView.Columns.Add("Type", 70)
+    [void]$listView.Columns.Add("Last Activity", 95)
+    [void]$listView.Columns.Add("Size", 90)
+    [void]$listView.Columns.Add("Status", 90)
+    [void]$listView.Columns.Add("Path", 290)
+    $dialog.Controls.Add($listView)
+
+    foreach ($candidate in $Candidates) {
+        $item = New-Object System.Windows.Forms.ListViewItem($candidate.SourceLabel)
+        [void]$item.SubItems.Add($candidate.CategoryLabel)
+        [void]$item.SubItems.Add($candidate.ItemKind)
+        [void]$item.SubItems.Add((Format-DateValue -Value $candidate.LastActivity))
+        [void]$item.SubItems.Add((Format-Bytes -Bytes $candidate.SizeBytes))
+        [void]$item.SubItems.Add((if ($candidate.ExistsNow) { "Ready" } else { "Missing" }))
+        [void]$item.SubItems.Add($candidate.Path)
+        $item.Tag = $candidate
+        $item.Checked = $candidate.SelectedByDefault
+        if (-not $candidate.ExistsNow) {
+            $item.ForeColor = [System.Drawing.Color]::Gray
+            $item.Checked = $false
+        }
+        [void]$listView.Items.Add($item)
+    }
+
+    $guardLabel = New-Object System.Windows.Forms.Label
+    $guardLabel.Location = New-Object System.Drawing.Point(24, 488)
+    $guardLabel.Size = New-Object System.Drawing.Size(932, 40)
+    $guardLabel.ForeColor = $script:MutedColor
+    if ($BlockedCandidates.Count -gt 0) {
+        $blockedPreview = (($BlockedCandidates | Select-Object -First 3).Path) -join " ; "
+        $guardLabel.Text = "$($BlockedCandidates.Count) high-risk path(s) were blocked and will not be executed. Example: $blockedPreview"
+    } else {
+        $guardLabel.Text = "No high-risk paths were detected in this phase-two run."
+    }
+    $dialog.Controls.Add($guardLabel)
+
+    $backupCheck = New-Object System.Windows.Forms.CheckBox
+    $backupCheck.Text = "Back up items before deletion"
+    $backupCheck.Location = New-Object System.Drawing.Point(24, 538)
+    $backupCheck.Size = New-Object System.Drawing.Size(250, 24)
+    $backupCheck.Checked = $true
+    $dialog.Controls.Add($backupCheck)
+
+    $recycleCheck = New-Object System.Windows.Forms.CheckBox
+    $recycleCheck.Text = "Prefer moving items to the Recycle Bin"
+    $recycleCheck.Location = New-Object System.Drawing.Point(292, 538)
+    $recycleCheck.Size = New-Object System.Drawing.Size(180, 24)
+    $recycleCheck.Checked = $true
+    $dialog.Controls.Add($recycleCheck)
+
+    $reportLabel = New-Object System.Windows.Forms.Label
+    $reportLabel.Text = "A TXT and JSON report will be generated automatically after execution."
+    $reportLabel.Location = New-Object System.Drawing.Point(24, 566)
+    $reportLabel.Size = New-Object System.Drawing.Size(420, 20)
+    $reportLabel.ForeColor = $script:MutedColor
+    $dialog.Controls.Add($reportLabel)
+
+    $selectedLabel = New-Object System.Windows.Forms.Label
+    $selectedLabel.Location = New-Object System.Drawing.Point(620, 538)
+    $selectedLabel.Size = New-Object System.Drawing.Size(160, 20)
+    $selectedLabel.ForeColor = $script:TextColor
+    $dialog.Controls.Add($selectedLabel)
+
+    $updateSelectedLabel = {
+        $checkedCount = @($listView.Items | Where-Object { $_.Checked }).Count
+        $selectedLabel.Text = "Selected: $checkedCount item(s)"
+    }
+
+    $listView.Add_ItemChecked({
+        & $updateSelectedLabel
+    })
+
+    $btnSelectAll = New-Object System.Windows.Forms.Button
+    $btnSelectAll.Text = "Select All Ready Items"
+    $btnSelectAll.Location = New-Object System.Drawing.Point(620, 566)
+    $btnSelectAll.Size = New-Object System.Drawing.Size(108, 32)
+    $btnSelectAll.BackColor = [System.Drawing.Color]::FromArgb(228, 221, 210)
+    $btnSelectAll.FlatStyle = "Flat"
+    $btnSelectAll.Add_Click({
+        foreach ($item in $listView.Items) {
+            if ($item.SubItems[5].Text -eq "Ready") {
+                $item.Checked = $true
+            }
+        }
+    })
+    $dialog.Controls.Add($btnSelectAll)
+
+    $btnClear = New-Object System.Windows.Forms.Button
+    $btnClear.Text = "Clear Selection"
+    $btnClear.Location = New-Object System.Drawing.Point(742, 566)
+    $btnClear.Size = New-Object System.Drawing.Size(90, 32)
+    $btnClear.BackColor = [System.Drawing.Color]::FromArgb(228, 221, 210)
+    $btnClear.FlatStyle = "Flat"
+    $btnClear.Add_Click({
+        foreach ($item in $listView.Items) {
+            $item.Checked = $false
+        }
+    })
+    $dialog.Controls.Add($btnClear)
+
+    $btnConfirm = New-Object System.Windows.Forms.Button
+    $btnConfirm.Text = "Execute"
+    $btnConfirm.Location = New-Object System.Drawing.Point(846, 566)
+    $btnConfirm.Size = New-Object System.Drawing.Size(110, 32)
+    $btnConfirm.BackColor = $script:DangerColor
+    $btnConfirm.ForeColor = [System.Drawing.Color]::White
+    $btnConfirm.FlatStyle = "Flat"
+    $dialog.Controls.Add($btnConfirm)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = "Cancel"
+    $btnCancel.Location = New-Object System.Drawing.Point(846, 604)
+    $btnCancel.Size = New-Object System.Drawing.Size(110, 24)
+    $btnCancel.FlatStyle = "Flat"
+    $btnCancel.Add_Click({
+        $dialog.Tag = $null
+        $dialog.Close()
+    })
+    $dialog.Controls.Add($btnCancel)
+
+    $btnConfirm.Add_Click({
+        $selected = @()
+        foreach ($item in $listView.Items) {
+            if ($item.Checked) {
+                $selected += $item.Tag
+            }
+        }
+
+        if ($selected.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "No executable items are selected yet.",
+                "Nothing Selected",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            ) | Out-Null
+            return
+        }
+
+        $dialog.Tag = [pscustomobject]@{
+            SelectedCandidates = $selected
+            CreateBackup = $backupCheck.Checked
+            UseRecycleBin = $recycleCheck.Checked
+        }
+        $dialog.Close()
+    })
+
+    & $updateSelectedLabel
+    [void]$dialog.ShowDialog()
+    return $dialog.Tag
+}
+
+function Invoke-ReviewedDeletion {
+    param(
+        [object[]]$SelectedCandidates,
+        [bool]$CreateBackup,
+        [bool]$UseRecycleBin,
+        [int]$BlockedCount,
+        [System.Windows.Forms.TextBox]$LogBox,
+        [System.Windows.Forms.ProgressBar]$ProgressBar,
+        [System.Windows.Forms.Label]$StatusLabel,
+        [System.Windows.Forms.Label]$ActivityLabel
+    )
+
+    if ($SelectedCandidates.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "There are no items to process in this run.",
+            "No Tasks",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+        return
+    }
+
+    $sessionId = Get-Date -Format "yyyyMMdd-HHmmss"
+    $sessionBackupPath = $null
+    if ($CreateBackup) {
+        Ensure-Directory -Path $script:BackupRoot
+        $sessionBackupPath = Join-Path $script:BackupRoot ("Backup-{0}" -f $sessionId)
+        Ensure-Directory -Path $sessionBackupPath
+    }
+
+    $entries = @()
+    Set-ProgressState -ProgressBar $ProgressBar -StatusLabel $StatusLabel -ActivityLabel $ActivityLabel -StatusText "Phase Two Running" -ActivityText "Initializing execution plan..." -Mode Step -Current 0 -Maximum $SelectedCandidates.Count
+    Write-UiLog -LogBox $LogBox -Message "Phase two started: $($SelectedCandidates.Count) selected item(s), deletion mode $(if ($UseRecycleBin) { 'Recycle Bin' } else { 'Permanent Delete' })."
+
+    for ($i = 0; $i -lt $SelectedCandidates.Count; $i++) {
+        $candidate = $SelectedCandidates[$i]
+        $candidate.ExistsNow = Test-Path -LiteralPath $candidate.Path
+        $guard = Get-PathGuard -Path $candidate.Path
+        $candidate.Blocked = $guard.Blocked
+        $candidate.BlockReason = $guard.Reason
+
+        Set-ProgressState -ProgressBar $ProgressBar -StatusLabel $StatusLabel -ActivityLabel $ActivityLabel -StatusText "Processing: $($i + 1) / $($SelectedCandidates.Count)" -ActivityText "Working on: $(Get-ShortDisplayPath -Path $candidate.Path)" -Mode Step -Current ($i + 1) -Maximum $SelectedCandidates.Count
+
+        if ($candidate.Blocked) {
+            $entries += [pscustomobject]@{
+                Path = $candidate.Path
+                SourceLabel = $candidate.SourceLabel
+                CategoryLabel = $candidate.CategoryLabel
+                Result = "Blocked"
+                Message = $candidate.BlockReason
+                BackupPath = ""
+            }
+            Write-UiLog -LogBox $LogBox -Message "Blocked: $($candidate.Path) ($($candidate.BlockReason))"
+            continue
+        }
+
+        if (-not $candidate.ExistsNow) {
+            $entries += [pscustomobject]@{
+                Path = $candidate.Path
+                SourceLabel = $candidate.SourceLabel
+                CategoryLabel = $candidate.CategoryLabel
+                Result = "Skipped"
+                Message = "Path does not exist"
+                BackupPath = ""
+            }
+            Write-UiLog -LogBox $LogBox -Message "Skipped: $($candidate.Path) (path does not exist)"
+            continue
+        }
+
+        $backupPath = ""
+        try {
+            if ($CreateBackup) {
+                $backupPath = Backup-Target -Candidate $candidate -SessionBackupPath $sessionBackupPath -Index ($i + 1)
+                Write-UiLog -LogBox $LogBox -Message "Backed up: $($candidate.Path) -> $backupPath"
+            }
+
+            Stop-TargetProcessIfNeeded -Candidate $candidate
+            Remove-TargetWithMode -Candidate $candidate -UseRecycleBin $UseRecycleBin
+
+            $entries += [pscustomobject]@{
+                Path = $candidate.Path
+                SourceLabel = $candidate.SourceLabel
+                CategoryLabel = $candidate.CategoryLabel
+                Result = "Success"
+                Message = if ($UseRecycleBin) { "Moved to Recycle Bin" } else { "Permanently deleted" }
+                BackupPath = $backupPath
+            }
+            Write-UiLog -LogBox $LogBox -Message "Processed: $($candidate.Path)"
+        } catch {
+            $entries += [pscustomobject]@{
+                Path = $candidate.Path
+                SourceLabel = $candidate.SourceLabel
+                CategoryLabel = $candidate.CategoryLabel
+                Result = "Skipped"
+                Message = $_.Exception.Message
+                BackupPath = $backupPath
+            }
+            Write-UiLog -LogBox $LogBox -Message "Skipped: $($candidate.Path) ($($_.Exception.Message))"
+        }
+    }
+
+    Set-ProgressState -ProgressBar $ProgressBar -StatusLabel $StatusLabel -ActivityLabel $ActivityLabel -StatusText "Phase Two Complete" -ActivityText "Generating execution report..." -Mode Step -Current $SelectedCandidates.Count -Maximum $SelectedCandidates.Count
+    $report = Save-DeletionReport -SessionId $sessionId -ReviewSnapshotPath $script:ReviewFilePath -BackupPath $sessionBackupPath -UseRecycleBin $UseRecycleBin -Entries $entries -BlockedCount $BlockedCount
+
+    $successCount = @($entries | Where-Object { $_.Result -eq "Success" }).Count
+    $skippedCount = @($entries | Where-Object { $_.Result -ne "Success" }).Count
+
+    Start-Process "notepad.exe" -ArgumentList $report.TextPath | Out-Null
+    Set-ProgressState -ProgressBar $ProgressBar -StatusLabel $StatusLabel -ActivityLabel $ActivityLabel -StatusText "Phase Two Complete" -ActivityText "Report created: $(Get-ShortDisplayPath -Path $report.TextPath)" -Mode Idle
+    [System.Windows.Forms.MessageBox]::Show(
+        "Phase two is complete.`r`nSucceeded: $successCount`r`nSkipped / Not Executed: $skippedCount`r`n`r`nReport: $($report.TextPath)",
+        "Execution Complete",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Information
+    ) | Out-Null
+}
+
+function Update-ReviewStatus {
+    param(
+        [System.Windows.Forms.Label]$Label,
+        [System.Windows.Forms.Button]$OpenButton,
+        [System.Windows.Forms.Button]$Phase2Button
+    )
+
+    if (Test-Path -LiteralPath $script:ReviewFilePath) {
+        $manifestState = if (Test-Path -LiteralPath $script:ManifestPath) { ", metadata available" } else { ", metadata missing" }
+        $Label.Text = "Review file: $script:ReviewFilePath$manifestState"
+        $OpenButton.Enabled = $true
+        $Phase2Button.Enabled = $true
+    } else {
+        $Label.Text = "Review file: not generated yet"
+        $OpenButton.Enabled = $false
+        $Phase2Button.Enabled = $false
+    }
+}
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Win Deep Cleaner"
+$form.StartPosition = "CenterScreen"
+$form.ClientSize = New-Object System.Drawing.Size(980, 680)
+$form.MinimumSize = New-Object System.Drawing.Size(980, 680)
+$form.BackColor = $script:CanvasColor
+$form.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9)
+
+$hero = New-Object System.Windows.Forms.Panel
+$hero.Location = New-Object System.Drawing.Point(0, 0)
+$hero.Size = New-Object System.Drawing.Size(980, 118)
+$hero.BackColor = $script:AccentColor
+$form.Controls.Add($hero)
+
+$title = New-Object System.Windows.Forms.Label
+$title.Text = "Win Deep Cleaner"
+$title.Location = New-Object System.Drawing.Point(28, 20)
+$title.Size = New-Object System.Drawing.Size(360, 34)
+$title.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 20, [System.Drawing.FontStyle]::Bold)
+$title.ForeColor = [System.Drawing.Color]::White
+$hero.Controls.Add($title)
+
+$subtitle = New-Object System.Windows.Forms.Label
+$subtitle.Text = "An AI-assisted Windows cleanup review tool: generate candidates first, then review and execute with backup and reports."
+$subtitle.Location = New-Object System.Drawing.Point(30, 60)
+$subtitle.Size = New-Object System.Drawing.Size(720, 24)
+$subtitle.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 10)
+$subtitle.ForeColor = [System.Drawing.Color]::FromArgb(231, 240, 236)
+$hero.Controls.Add($subtitle)
+
+$phase1Card = New-Object System.Windows.Forms.Panel
+$phase1Card.Location = New-Object System.Drawing.Point(28, 144)
+$phase1Card.Size = New-Object System.Drawing.Size(442, 194)
+$phase1Card.BackColor = $script:CardColor
+$phase1Card.BorderStyle = "FixedSingle"
+$form.Controls.Add($phase1Card)
+
+$phase1Title = New-Object System.Windows.Forms.Label
+$phase1Title.Text = "Phase One: Scan and Generate Review List"
+$phase1Title.Location = New-Object System.Drawing.Point(18, 16)
+$phase1Title.Size = New-Object System.Drawing.Size(260, 28)
+$phase1Title.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 13, [System.Drawing.FontStyle]::Bold)
+$phase1Title.ForeColor = $script:AccentColor
+$phase1Card.Controls.Add($phase1Title)
+
+$phase1Text = New-Object System.Windows.Forms.Label
+$phase1Text.Text = "Scans startup items, app caches, developer caches, and inactive installers or large files in Downloads, Desktop, and Documents. High-risk paths are blocked automatically."
+$phase1Text.Location = New-Object System.Drawing.Point(18, 52)
+$phase1Text.Size = New-Object System.Drawing.Size(398, 66)
+$phase1Text.ForeColor = $script:TextColor
+$phase1Card.Controls.Add($phase1Text)
+
+$btnPhase1 = New-Object System.Windows.Forms.Button
+$btnPhase1.Text = "Start Phase One"
+$btnPhase1.Location = New-Object System.Drawing.Point(18, 132)
+$btnPhase1.Size = New-Object System.Drawing.Size(180, 40)
+$btnPhase1.BackColor = $script:AccentColor
+$btnPhase1.ForeColor = [System.Drawing.Color]::White
+$btnPhase1.FlatStyle = "Flat"
+$btnPhase1.Tag = "action-button"
+$phase1Card.Controls.Add($btnPhase1)
+
+$phase2Card = New-Object System.Windows.Forms.Panel
+$phase2Card.Location = New-Object System.Drawing.Point(500, 144)
+$phase2Card.Size = New-Object System.Drawing.Size(452, 194)
+$phase2Card.BackColor = $script:CardColor
+$phase2Card.BorderStyle = "FixedSingle"
+$form.Controls.Add($phase2Card)
+
+$phase2Title = New-Object System.Windows.Forms.Label
+$phase2Title.Text = "Phase Two: Review and Execute"
+$phase2Title.Location = New-Object System.Drawing.Point(18, 16)
+$phase2Title.Size = New-Object System.Drawing.Size(250, 28)
+$phase2Title.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 13, [System.Drawing.FontStyle]::Bold)
+$phase2Title.ForeColor = $script:DangerColor
+$phase2Card.Controls.Add($phase2Title)
+
+$phase2Text = New-Object System.Windows.Forms.Label
+$phase2Text.Text = "After you edit the TXT file, phase two loads the remaining candidates into a checkbox list and offers backup, Recycle Bin, and audit report options."
+$phase2Text.Location = New-Object System.Drawing.Point(18, 52)
+$phase2Text.Size = New-Object System.Drawing.Size(412, 52)
+$phase2Text.ForeColor = $script:TextColor
+$phase2Card.Controls.Add($phase2Text)
+
+$btnPhase2 = New-Object System.Windows.Forms.Button
+$btnPhase2.Text = "Start Phase Two"
+$btnPhase2.Location = New-Object System.Drawing.Point(18, 132)
+$btnPhase2.Size = New-Object System.Drawing.Size(180, 40)
+$btnPhase2.BackColor = $script:DangerColor
+$btnPhase2.ForeColor = [System.Drawing.Color]::White
+$btnPhase2.FlatStyle = "Flat"
+$btnPhase2.Tag = "action-button"
+$phase2Card.Controls.Add($btnPhase2)
+
+$statusCard = New-Object System.Windows.Forms.Panel
+$statusCard.Location = New-Object System.Drawing.Point(28, 360)
+$statusCard.Size = New-Object System.Drawing.Size(924, 126)
+$statusCard.BackColor = $script:CardColor
+$statusCard.BorderStyle = "FixedSingle"
+$form.Controls.Add($statusCard)
+
+$reviewStatusTitle = New-Object System.Windows.Forms.Label
+$reviewStatusTitle.Text = "Review File Status"
+$reviewStatusTitle.Location = New-Object System.Drawing.Point(18, 16)
+$reviewStatusTitle.Size = New-Object System.Drawing.Size(180, 24)
+$reviewStatusTitle.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 11, [System.Drawing.FontStyle]::Bold)
+$reviewStatusTitle.ForeColor = $script:TextColor
+$statusCard.Controls.Add($reviewStatusTitle)
+
+$reviewPathLabel = New-Object System.Windows.Forms.Label
+$reviewPathLabel.Location = New-Object System.Drawing.Point(18, 44)
+$reviewPathLabel.Size = New-Object System.Drawing.Size(610, 22)
+$reviewPathLabel.ForeColor = $script:MutedColor
+$statusCard.Controls.Add($reviewPathLabel)
+
+$btnOpenReview = New-Object System.Windows.Forms.Button
+$btnOpenReview.Text = "Open Review File"
+$btnOpenReview.Location = New-Object System.Drawing.Point(666, 18)
+$btnOpenReview.Size = New-Object System.Drawing.Size(112, 34)
+$btnOpenReview.BackColor = [System.Drawing.Color]::FromArgb(228, 221, 210)
+$btnOpenReview.FlatStyle = "Flat"
+$btnOpenReview.Tag = "action-button"
+$statusCard.Controls.Add($btnOpenReview)
+
+$btnRefresh = New-Object System.Windows.Forms.Button
+$btnRefresh.Text = "Refresh Status"
+$btnRefresh.Location = New-Object System.Drawing.Point(792, 18)
+$btnRefresh.Size = New-Object System.Drawing.Size(112, 34)
+$btnRefresh.BackColor = [System.Drawing.Color]::FromArgb(228, 221, 210)
+$btnRefresh.FlatStyle = "Flat"
+$btnRefresh.Tag = "action-button"
+$statusCard.Controls.Add($btnRefresh)
+
+$progressLabel = New-Object System.Windows.Forms.Label
+$progressLabel.Text = "Waiting"
+$progressLabel.Location = New-Object System.Drawing.Point(666, 60)
+$progressLabel.Size = New-Object System.Drawing.Size(238, 20)
+$progressLabel.ForeColor = $script:MutedColor
+$statusCard.Controls.Add($progressLabel)
+
+$progressBar = New-Object System.Windows.Forms.ProgressBar
+$progressBar.Location = New-Object System.Drawing.Point(18, 72)
+$progressBar.Size = New-Object System.Drawing.Size(610, 10)
+$progressBar.Style = "Continuous"
+$statusCard.Controls.Add($progressBar)
+
+$activityLabel = New-Object System.Windows.Forms.Label
+$activityLabel.Text = "Current task: waiting to start"
+$activityLabel.Location = New-Object System.Drawing.Point(18, 90)
+$activityLabel.Size = New-Object System.Drawing.Size(886, 22)
+$activityLabel.ForeColor = $script:TextColor
+$statusCard.Controls.Add($activityLabel)
+
+$logCard = New-Object System.Windows.Forms.Panel
+$logCard.Location = New-Object System.Drawing.Point(28, 510)
+$logCard.Size = New-Object System.Drawing.Size(924, 140)
+$logCard.BackColor = $script:CardColor
+$logCard.BorderStyle = "FixedSingle"
+$form.Controls.Add($logCard)
+
+$logTitle = New-Object System.Windows.Forms.Label
+$logTitle.Text = "Activity Log"
+$logTitle.Location = New-Object System.Drawing.Point(18, 14)
+$logTitle.Size = New-Object System.Drawing.Size(160, 24)
+$logTitle.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 11, [System.Drawing.FontStyle]::Bold)
+$logTitle.ForeColor = $script:TextColor
+$logCard.Controls.Add($logTitle)
+
+$logBox = New-Object System.Windows.Forms.TextBox
+$logBox.Location = New-Object System.Drawing.Point(18, 44)
+$logBox.Size = New-Object System.Drawing.Size(886, 78)
+$logBox.Multiline = $true
+$logBox.ScrollBars = "Vertical"
+$logBox.ReadOnly = $true
+$logBox.BackColor = [System.Drawing.Color]::FromArgb(252, 249, 244)
+$logBox.Font = New-Object System.Drawing.Font("Consolas", 9)
+$logCard.Controls.Add($logBox)
+
+$btnPhase1.Add_Click({
+    try {
+        $phase1TotalSteps = 6
+        Set-UiBusyState -Form $form -IsBusy $true
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Preparing phase one..." -Mode Step -Current 0 -Maximum $phase1TotalSteps
+        Write-UiLog -LogBox $logBox -Message "Phase one started: running system cleanup and collecting candidate items."
+
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 1/$phase1TotalSteps: running DISM cleanup..." -Mode Marquee
+        Wait-ExternalProcess -FilePath "dism.exe" -ArgumentList "/Online /Cleanup-Image /StartComponentCleanup" -LogBox $logBox -StartMessage "Running DISM to clean WinSxS components and update residue. This may take several minutes." -EndMessage "DISM finished." -ContinueOnError $true
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 1/$phase1TotalSteps complete: DISM finished." -Mode Step -Current 1 -Maximum $phase1TotalSteps
+
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 2/$phase1TotalSteps: running Disk Cleanup..." -Mode Marquee
+        Wait-ExternalProcess -FilePath "cleanmgr.exe" -ArgumentList "/d c /VERYLOWDISK" -LogBox $logBox -StartMessage "Running cleanmgr for system disk cleanup." -EndMessage "Disk Cleanup finished." -ContinueOnError $true
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 2/$phase1TotalSteps complete: Disk Cleanup finished." -Mode Step -Current 2 -Maximum $phase1TotalSteps
+
+        Write-UiLog -LogBox $logBox -Message "Scanning third-party startup items."
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 3/$phase1TotalSteps: scanning startup items..." -Mode Marquee
+        $startupCandidates = Get-StartupCandidateRecords
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 3/$phase1TotalSteps complete: found $($startupCandidates.Count) startup candidate(s)." -Mode Step -Current 3 -Maximum $phase1TotalSteps
+
+        Write-UiLog -LogBox $logBox -Message "Scanning app caches and developer caches."
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 4/$phase1TotalSteps: scanning app and developer caches..." -Mode Marquee
+        $cacheCandidates = Get-CacheCandidateRecords
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 4/$phase1TotalSteps complete: found $($cacheCandidates.Count) cache candidate(s)." -Mode Step -Current 4 -Maximum $phase1TotalSteps
+
+        Write-UiLog -LogBox $logBox -Message "Scanning inactive installers and large files in Downloads, Desktop, and Documents."
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 5/$phase1TotalSteps: scanning inactive files..." -Mode Marquee
+        $inactiveFileCandidates = Get-InactiveFileCandidateRecords -InactiveDays 180
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 5/$phase1TotalSteps complete: found $($inactiveFileCandidates.Count) inactive file candidate(s)." -Mode Step -Current 5 -Maximum $phase1TotalSteps
+
+        $allCandidates = Merge-CandidateRecords -Candidates ($startupCandidates + $cacheCandidates + $inactiveFileCandidates)
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 6/$phase1TotalSteps: creating review file and metadata..." -Mode Marquee
+        $artifactInfo = Save-ReviewArtifacts -Candidates $allCandidates
+
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Complete" -ActivityText "Review list created with $($artifactInfo.SafeCandidates.Count) candidate(s)." -Mode Idle
+        Update-ReviewStatus -Label $reviewPathLabel -OpenButton $btnOpenReview -Phase2Button $btnPhase2
+
+        Write-UiLog -LogBox $logBox -Message "Phase one complete: $($artifactInfo.SafeCandidates.Count) reviewable candidate(s), $($artifactInfo.BlockedCandidates.Count) high-risk path(s) blocked."
+        Write-UiLog -LogBox $logBox -Message "Review file: $script:ReviewFilePath"
+        Write-UiLog -LogBox $logBox -Message "Metadata file: $script:ManifestPath"
+        Start-Process "notepad.exe" -ArgumentList $script:ReviewFilePath | Out-Null
+
+        [System.Windows.Forms.MessageBox]::Show(
+            "Phase one is complete.`r`n`r`n1. The review TXT and metadata file were created on the Desktop.`r`n2. Every candidate includes a source label.`r`n3. You can send the TXT to an AI model or review it manually.`r`n4. Save the TXT, then return to the main window and start phase two.",
+            "Phase One Complete",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+    } catch {
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Failed" -ActivityText "Interrupted: $($_.Exception.Message)" -Mode Idle
+        Write-UiLog -LogBox $logBox -Message "Phase one failed: $($_.Exception.Message)"
+        [System.Windows.Forms.MessageBox]::Show(
+            "Phase one failed: $($_.Exception.Message)",
+            "Error",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+    } finally {
+        Set-UiBusyState -Form $form -IsBusy $false
+        Update-ReviewStatus -Label $reviewPathLabel -OpenButton $btnOpenReview -Phase2Button $btnPhase2
+    }
+})
+
+$btnOpenReview.Add_Click({
+    if (Test-Path -LiteralPath $script:ReviewFilePath) {
+        Start-Process "notepad.exe" -ArgumentList $script:ReviewFilePath | Out-Null
+        Write-UiLog -LogBox $logBox -Message "Review file opened."
+    } else {
+        [System.Windows.Forms.MessageBox]::Show(
+            "There is no review file yet. Please run phase one first.",
+            "No File",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+    }
+})
+
+$btnRefresh.Add_Click({
+    Update-ReviewStatus -Label $reviewPathLabel -OpenButton $btnOpenReview -Phase2Button $btnPhase2
+    Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Waiting" -ActivityText "Status refreshed. Waiting for the next action." -Mode Idle
+    Write-UiLog -LogBox $logBox -Message "Review file status refreshed."
+})
+
+$btnPhase2.Add_Click({
+    try {
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Preparing Phase Two" -ActivityText "Reading the review file..." -Mode Marquee
+        $reviewedPaths = Get-ReviewedPaths
+        if ($reviewedPaths.Count -eq 0) {
+            Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Waiting" -ActivityText "No executable paths were found. Please save your review results first." -Mode Idle
+            [System.Windows.Forms.MessageBox]::Show(
+                "No paths were read from the review TXT. Please complete phase one first and keep the lines you want to process.",
+                "Nothing To Execute",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            ) | Out-Null
+            return
+        }
+
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Preparing Phase Two" -ActivityText "Resolving reviewed items and applying safety rules..." -Mode Marquee
+        $manifestCandidates = Load-CandidateManifest
+        $resolution = Resolve-ReviewedCandidates -ReviewedPaths $reviewedPaths -ManifestCandidates $manifestCandidates
+        if ($resolution.Allowed.Count -eq 0) {
+            Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Waiting" -ActivityText "No executable candidates remain. They may all be blocked or missing." -Mode Idle
+            [System.Windows.Forms.MessageBox]::Show(
+                "All paths in the review file were blocked by safety rules or no longer exist. Nothing can be executed.",
+                "No Executable Items",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            ) | Out-Null
+            return
+        }
+
+        Write-UiLog -LogBox $logBox -Message "Phase two ready: $($resolution.Allowed.Count) executable candidate(s) loaded, $($resolution.Blocked.Count) high-risk path(s) blocked."
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Waiting for Confirmation" -ActivityText "Loaded $($resolution.Allowed.Count) candidate(s). Confirm the items in the checkbox window." -Mode Idle
+        $plan = Show-ExecutionPlannerDialog -Candidates $resolution.Allowed -BlockedCandidates $resolution.Blocked
+        if (-not $plan) {
+            Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase Two Cancelled" -ActivityText "You cancelled the checkbox confirmation. No deletion was performed." -Mode Idle
+            Write-UiLog -LogBox $logBox -Message "Phase two cancelled. Nothing was executed."
+            return
+        }
+
+        Set-UiBusyState -Form $form -IsBusy $true
+        Invoke-ReviewedDeletion -SelectedCandidates $plan.SelectedCandidates -CreateBackup $plan.CreateBackup -UseRecycleBin $plan.UseRecycleBin -BlockedCount $resolution.Blocked.Count -LogBox $logBox -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel
+    } catch {
+        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase Two Failed" -ActivityText "Interrupted: $($_.Exception.Message)" -Mode Idle
+        Write-UiLog -LogBox $logBox -Message "Phase two failed: $($_.Exception.Message)"
+        [System.Windows.Forms.MessageBox]::Show(
+            "Phase two failed: $($_.Exception.Message)",
+            "Error",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+    } finally {
+        Set-UiBusyState -Form $form -IsBusy $false
+        Update-ReviewStatus -Label $reviewPathLabel -OpenButton $btnOpenReview -Phase2Button $btnPhase2
+    }
+})
+
+Update-ReviewStatus -Label $reviewPathLabel -OpenButton $btnOpenReview -Phase2Button $btnPhase2
+Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Waiting" -ActivityText "Current task: run phase one to generate the review list." -Mode Idle
+Write-UiLog -LogBox $logBox -Message "UI started. Run phase one to generate the review list, edit the TXT file, then start phase two."
+
+[void]$form.ShowDialog()
