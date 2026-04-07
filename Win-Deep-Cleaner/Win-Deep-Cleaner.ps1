@@ -227,13 +227,15 @@ function Get-PathFromLine {
     $cleaned = $Line.Trim()
     $cleaned = $cleaned -replace '^[\-\*\u2022]+\s*', ''
     $cleaned = $cleaned -replace '^\d+[\.\)]\s*', ''
-    $cleaned = $cleaned.Trim('"', "'", '“', '”', '‘', '’', '`')
+    $cleaned = $cleaned.Trim('"', "'", '`')
+    $cleaned = $cleaned -replace '[\u201C\u201D\u2018\u2019]', ''
 
     if ($cleaned -match '(?i)([a-z]:\\.*)$') {
         $path = $matches[1].Trim()
-        $path = $path.Trim('"', "'", '“', '”', '‘', '’', '`')
-        $path = $path -replace '["''“”‘’`]+$', ''
-        $path = $path -replace '[,，;；。]+$', ''
+        $path = $path.Trim('"', "'", '`')
+        $path = $path -replace '[\u201C\u201D\u2018\u2019]', ''
+        $path = $path -replace '["''`]+$', ''
+        $path = $path -replace '[,\uFF0C;\uFF1B\u3002]+$', ''
         return $path
     }
 
