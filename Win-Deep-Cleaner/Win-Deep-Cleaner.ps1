@@ -172,14 +172,7 @@ function Get-PathGuard {
         (Join-Path $env:ProgramData "Microsoft\Windows")
     ) | Where-Object { $_ } | ForEach-Object { Get-NormalizedPath -Path $_ }
 
-    if ($normalized -eq (Get-NormalizedPath -Path $env:SystemDrive)) {
-        return [pscustomobject]@{
-            Blocked = $true
-            Reason = "System drive root is blocked"
-        }
-    }
-
-    if ($normalized -eq $systemDriveRoot.TrimEnd('\').ToLowerInvariant()) {
+    if ($normalized -eq $systemDriveRoot.TrimEnd('\')) {
         return [pscustomobject]@{
             Blocked = $true
             Reason = "System drive root is blocked"
@@ -924,48 +917,231 @@ function Resolve-ReviewedCandidates {
     }
 }
 
+$script:SystemProcessNames = @(
+    'system', 'smss', 'csrss', 'wininit', 'winlogon', 'services', 'lsass', 'lsm',
+    'svchost', 'spoolsv', 'msdtc', 'taskhost', 'taskhostw', 'dwm', 'conhost',
+    'audiodg', 'wuauclt', 'searchindexer', 'trustedinstaller', 'tiworker',
+    'registry', 'memory compression', 'secure system'
+)
+
+function Find-FileLockedProcesses {
+    param([string]$FilePath)
+
+    $lockedProcesses = [System.Collections.Generic.List[object]]::new()
+    $normalizedTarget = Get-NormalizedPath -Path $FilePath
+    if (-not $normalizedTarget) { return $lockedProcesses }
+
+    # Method 1: If the target is an executable, find running processes by path match
+    $extension = [System.IO.Path]::GetExtension($FilePath).ToLowerInvariant()
+    if ($extension -in @('.exe', '.dll', '.scr', '.com')) {
+        try {
+            $allProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+            foreach ($proc in $allProcs) {
+                if (-not $proc.ExecutablePath) { continue }
+                $procPath = Get-NormalizedPath -Path $proc.ExecutablePath
+                if ($procPath -eq $normalizedTarget) {
+                    $lockedProcesses.Add([pscustomobject]@{
+                        ProcessId   = [int]$proc.ProcessId
+                        ProcessName = $proc.Name
+                        Method      = 'ProcessMatch'
+                    })
+                }
+            }
+        } catch {}
+    }
+
+    # Method 2: Try exclusive open; if locked, attempt Handle.exe (Sysinternals)
+    if ($lockedProcesses.Count -eq 0 -and (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
+        $isLocked = $false
+        try {
+            $fs = [System.IO.File]::Open($FilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            $fs.Close()
+            $fs.Dispose()
+        } catch [System.IO.IOException] {
+            $isLocked = $true
+        } catch {}
+
+        if ($isLocked) {
+            $handleExe = Get-Command 'handle.exe' -ErrorAction SilentlyContinue
+            if (-not $handleExe) {
+                $handleExe = Get-Command 'handle64.exe' -ErrorAction SilentlyContinue
+            }
+            if ($handleExe) {
+                try {
+                    $output = & $handleExe.Source $FilePath -nobanner 2>$null
+                    foreach ($line in $output) {
+                        if ($line -match '^(.+?)\s+pid:\s+(\d+)\s+') {
+                            $pid = [int]$Matches[2]
+                            $procName = $Matches[1].Trim()
+                            if (-not ($lockedProcesses | Where-Object { $_.ProcessId -eq $pid })) {
+                                $lockedProcesses.Add([pscustomobject]@{
+                                    ProcessId   = $pid
+                                    ProcessName = $procName
+                                    Method      = 'HandleExe'
+                                })
+                            }
+                        }
+                    }
+                } catch {}
+            }
+        }
+    }
+
+    return @($lockedProcesses)
+}
+
+function Stop-TargetProcessWithRetry {
+    param(
+        [string]$TargetPath,
+        [int]$MaxRetries = 3,
+        [System.Windows.Forms.TextBox]$LogBox = $null
+    )
+
+    $stopped = [System.Collections.Generic.List[string]]::new()
+    $failed  = [System.Collections.Generic.List[string]]::new()
+
+    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+        $locked = Find-FileLockedProcesses -FilePath $TargetPath
+        if ($locked.Count -eq 0) {
+            return [pscustomobject]@{ Success = $true; Stopped = @($stopped); Failed = @($failed) }
+        }
+
+        foreach ($info in $locked) {
+            $name = $info.ProcessName -replace '(?i)\.exe$', ''
+            if ($script:SystemProcessNames -contains $name.ToLowerInvariant()) {
+                Write-UiLog -LogBox $LogBox -Message "  Skipping system process: $($info.ProcessName) [PID $($info.ProcessId)]"
+                $failed.Add($info.ProcessName)
+                continue
+            }
+
+            try {
+                Write-UiLog -LogBox $LogBox -Message "  Stopping: $($info.ProcessName) [PID $($info.ProcessId)] (attempt $attempt/$MaxRetries)"
+                Stop-Process -Id $info.ProcessId -Force -ErrorAction Stop
+                Start-Sleep -Milliseconds 600
+
+                if (-not (Get-Process -Id $info.ProcessId -ErrorAction SilentlyContinue)) {
+                    Write-UiLog -LogBox $LogBox -Message "  Stopped: $($info.ProcessName)"
+                    $stopped.Add($info.ProcessName)
+                } else {
+                    Write-UiLog -LogBox $LogBox -Message "  Process did not exit after stop signal: $($info.ProcessName)"
+                    $failed.Add($info.ProcessName)
+                }
+            } catch {
+                Write-UiLog -LogBox $LogBox -Message "  Failed to stop $($info.ProcessName): $($_.Exception.Message)"
+                $failed.Add($info.ProcessName)
+            }
+        }
+
+        $remaining = Find-FileLockedProcesses -FilePath $TargetPath
+        if ($remaining.Count -eq 0) {
+            return [pscustomobject]@{ Success = $true; Stopped = @($stopped); Failed = @($failed) }
+        }
+
+        if ($attempt -lt $MaxRetries) {
+            Start-Sleep -Seconds 1
+        }
+    }
+
+    return [pscustomobject]@{ Success = $false; Stopped = @($stopped); Failed = @($failed) }
+}
+
 function Stop-TargetProcessIfNeeded {
     param([object]$Candidate)
 
-    if (-not $Candidate.ExistsNow) {
-        return
-    }
-
-    if ($Candidate.ItemKind -ne "File") {
+    if (-not $Candidate.ExistsNow -or $Candidate.ItemKind -ne "File") {
         return
     }
 
     $extension = [System.IO.Path]::GetExtension($Candidate.Path).ToLowerInvariant()
-    if ($extension -notin @(".exe", ".bat", ".cmd", ".ps1", ".vbs")) {
+    if ($extension -notin @(".exe", ".bat", ".cmd", ".ps1", ".vbs", ".dll", ".scr")) {
         return
     }
 
-    $processName = [System.IO.Path]::GetFileName($Candidate.Path)
-    $normalizedTargetPath = Get-NormalizedPath -Path $Candidate.Path
-    if (-not $processName -or -not $normalizedTargetPath) {
-        return
-    }
+    [void](Stop-TargetProcessWithRetry -TargetPath $Candidate.Path)
+}
+
+function Detect-RoguewareCharacteristics {
+    param([string]$FilePath)
+
+    $flags = [System.Collections.Generic.List[string]]::new()
 
     try {
-        $escapedProcessName = $processName.Replace("'", "''")
-        $matchingProcesses = Get-CimInstance Win32_Process -Filter "Name = '$escapedProcessName'" -ErrorAction Stop
+        $item = Get-Item -LiteralPath $FilePath -Force -ErrorAction SilentlyContinue
+        if (-not $item) { return @($flags) }
+
+        if (Test-FileAttribute -Item $item -Attribute ([System.IO.FileAttributes]::Hidden)) {
+            $flags.Add('Hidden')
+        }
+
+        if (Test-FileAttribute -Item $item -Attribute ([System.IO.FileAttributes]::System)) {
+            $flags.Add('System')
+        }
+
+        if (Test-FileAttribute -Item $item -Attribute ([System.IO.FileAttributes]::ReadOnly)) {
+            $flags.Add('ReadOnly')
+        }
+
+        $doubleExtPattern = '(?i)\.(pdf|docx?|xlsx?|pptx?|txt|jpg|jpeg|png|gif|zip|rar|7z)\.(exe|scr|js|jse|vbs|vbe|bat|cmd|com|pif|ps1)$'
+        if ($item.Name -match $doubleExtPattern) {
+            $flags.Add('DoubleExtension')
+        }
+
+        $ext = $item.Extension.ToLowerInvariant()
+        if (-not $item.PSIsContainer -and $ext -in @('.exe', '.dll', '.scr', '.com') -and $item.Length -le 2MB) {
+            $flags.Add('SmallExecutable')
+        }
+
+        if (-not $item.PSIsContainer -and $item.CreationTime -gt (Get-Date).AddDays(-30)) {
+            $flags.Add('RecentlyCreated')
+        }
+    } catch {}
+
+    return @($flags)
+}
+
+function Disable-RogueSelfProtection {
+    param(
+        [string]$TargetPath,
+        [System.Windows.Forms.TextBox]$LogBox = $null
+    )
+
+    $changed = $false
+
+    try {
+        $item = Get-Item -LiteralPath $TargetPath -Force -ErrorAction Stop
+
+        $attribsToRemove = @()
+        if (Test-FileAttribute -Item $item -Attribute ([System.IO.FileAttributes]::Hidden))   { $attribsToRemove += 'H' }
+        if (Test-FileAttribute -Item $item -Attribute ([System.IO.FileAttributes]::System))   { $attribsToRemove += 'S' }
+        if (Test-FileAttribute -Item $item -Attribute ([System.IO.FileAttributes]::ReadOnly)) { $attribsToRemove += 'R' }
+
+        if ($attribsToRemove.Count -gt 0) {
+            $attribArgs = ($attribsToRemove | ForEach-Object { "-$_" }) -join ' '
+            $recurseFlag = if ($item.PSIsContainer) { '/S /D' } else { '' }
+            $cmd = "attrib $attribArgs `"$TargetPath`" $recurseFlag"
+            Write-UiLog -LogBox $LogBox -Message "  Removing attributes ($($attribsToRemove -join ', ')): $TargetPath"
+            $result = & cmd.exe /c $cmd 2>&1
+            $changed = $true
+        }
+
+        # Grant current user full control so deletion succeeds
+        if ($item.PSIsContainer) {
+            & takeown.exe /F "$TargetPath" /R /D Y 2>&1 | Out-Null
+            & icacls.exe "$TargetPath" /grant "$($env:USERNAME):F" /T /C /Q 2>&1 | Out-Null
+        } else {
+            & takeown.exe /F "$TargetPath" 2>&1 | Out-Null
+            & icacls.exe "$TargetPath" /grant "$($env:USERNAME):F" /C /Q 2>&1 | Out-Null
+        }
+
+        if ($changed) {
+            Write-UiLog -LogBox $LogBox -Message "  Self-protection disabled on: $TargetPath"
+            Start-Sleep -Milliseconds 400
+        }
     } catch {
-        return
+        Write-UiLog -LogBox $LogBox -Message "  Warning: Could not disable self-protection: $($_.Exception.Message)"
     }
 
-    foreach ($process in $matchingProcesses) {
-        $processPath = Get-NormalizedPath -Path $process.ExecutablePath
-        if (-not $processPath -or $processPath -ne $normalizedTargetPath) {
-            continue
-        }
-
-        try {
-            Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
-            Start-Sleep -Milliseconds 150
-        } catch {
-            continue
-        }
-    }
+    return $changed
 }
 
 function Backup-Target {
@@ -1007,6 +1183,90 @@ function Remove-TargetWithMode {
     }
 }
 
+function Remove-TargetWithFallback {
+    param(
+        [object]$Candidate,
+        [bool]$UseRecycleBin,
+        [bool]$ForceRemove = $false,
+        [bool]$DetectRogueware = $true,
+        [System.Windows.Forms.TextBox]$LogBox = $null
+    )
+
+    $path = $Candidate.Path
+
+    # Re-check existence
+    if (-not (Test-Path -LiteralPath $path)) {
+        return [pscustomobject]@{ Success = $true; Message = "Already absent" }
+    }
+
+    # Step 1: Stop any locking processes
+    Write-UiLog -LogBox $LogBox -Message "  [1/4] Checking for locking processes..."
+    $procResult = Stop-TargetProcessWithRetry -TargetPath $path -LogBox $LogBox
+    if (-not $procResult.Success -and $procResult.Failed.Count -gt 0) {
+        $failedNames = ($procResult.Failed | Select-Object -Unique) -join ', '
+        if (-not $ForceRemove) {
+            return [pscustomobject]@{
+                Success = $false
+                Message = "Locking process(es) could not be stopped: $failedNames"
+            }
+        }
+        Write-UiLog -LogBox $LogBox -Message "  Force mode: continuing despite locked process(es): $failedNames"
+    }
+
+    # Step 2: Detect and disable rogue self-protection
+    if ($DetectRogueware) {
+        Write-UiLog -LogBox $LogBox -Message "  [2/4] Checking for self-protection mechanisms..."
+        $chars = Detect-RoguewareCharacteristics -FilePath $path
+        if ($chars.Count -gt 0) {
+            Write-UiLog -LogBox $LogBox -Message "  Rogue characteristics detected: $($chars -join ', ')"
+            [void](Disable-RogueSelfProtection -TargetPath $path -LogBox $LogBox)
+        }
+    }
+
+    # Step 3: Standard deletion
+    Write-UiLog -LogBox $LogBox -Message "  [3/4] Attempting standard deletion..."
+    try {
+        Remove-TargetWithMode -Candidate $Candidate -UseRecycleBin $UseRecycleBin
+        Start-Sleep -Milliseconds 300
+        if (-not (Test-Path -LiteralPath $path)) {
+            return [pscustomobject]@{ Success = $true; Message = if ($UseRecycleBin) { "Moved to Recycle Bin" } else { "Permanently deleted" } }
+        }
+    } catch {
+        Write-UiLog -LogBox $LogBox -Message "  Standard deletion failed: $($_.Exception.Message)"
+    }
+
+    # Step 4: Force deletion via cmd when ForceRemove is set
+    if ($ForceRemove) {
+        Write-UiLog -LogBox $LogBox -Message "  [4/4] Attempting forced deletion via system commands..."
+        try {
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            if ($item) {
+                if ($item.PSIsContainer) {
+                    & cmd.exe /c "rd /s /q `"$path`"" 2>&1 | Out-Null
+                } else {
+                    & cmd.exe /c "del /f /q `"$path`"" 2>&1 | Out-Null
+                }
+                Start-Sleep -Milliseconds 500
+            }
+            if (-not (Test-Path -LiteralPath $path)) {
+                return [pscustomobject]@{ Success = $true; Message = "Force-deleted via system command" }
+            }
+        } catch {
+            Write-UiLog -LogBox $LogBox -Message "  Forced deletion also failed: $($_.Exception.Message)"
+        }
+
+        return [pscustomobject]@{
+            Success = $false
+            Message = "Could not delete even with force. Manual removal may be required: $path"
+        }
+    }
+
+    return [pscustomobject]@{
+        Success = $false
+        Message = "Deletion failed. Enable 'Force Delete' mode for a more aggressive attempt."
+    }
+}
+
 function Save-DeletionReport {
     param(
         [string]$SessionId,
@@ -1023,7 +1283,8 @@ function Save-DeletionReport {
     $jsonPath = "$reportBase.json"
 
     $successCount = @($Entries | Where-Object { $_.Result -eq "Success" }).Count
-    $skippedCount = @($Entries | Where-Object { $_.Result -ne "Success" }).Count
+    $failedCount  = @($Entries | Where-Object { $_.Result -eq "Failed" }).Count
+    $skippedCount = @($Entries | Where-Object { $_.Result -notin @("Success", "Failed") }).Count
     $backupPathText = "-"
     if ($BackupPath) {
         $backupPathText = $BackupPath
@@ -1043,6 +1304,7 @@ function Save-DeletionReport {
         "DeletionMode: $deletionModeText"
         "BlockedByGuard: $BlockedCount"
         "SuccessCount: $successCount"
+        "FailedCount: $failedCount"
         "SkippedCount: $skippedCount"
         ""
         "Details:"
@@ -1082,7 +1344,7 @@ function Show-ExecutionPlannerDialog {
     $dialog.FormBorderStyle = "FixedDialog"
     $dialog.MaximizeBox = $false
     $dialog.MinimizeBox = $false
-    $dialog.ClientSize = New-Object System.Drawing.Size(980, 640)
+    $dialog.ClientSize = New-Object System.Drawing.Size(980, 680)
     $dialog.BackColor = $script:CardColor
     $dialog.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9)
 
@@ -1152,24 +1414,41 @@ function Show-ExecutionPlannerDialog {
     }
     $dialog.Controls.Add($guardLabel)
 
+    # Row 1 options
     $backupCheck = New-Object System.Windows.Forms.CheckBox
     $backupCheck.Text = "Back up items before deletion"
     $backupCheck.Location = New-Object System.Drawing.Point(24, 538)
-    $backupCheck.Size = New-Object System.Drawing.Size(250, 24)
+    $backupCheck.Size = New-Object System.Drawing.Size(230, 24)
     $backupCheck.Checked = $true
     $dialog.Controls.Add($backupCheck)
 
     $recycleCheck = New-Object System.Windows.Forms.CheckBox
-    $recycleCheck.Text = "Prefer moving items to the Recycle Bin"
-    $recycleCheck.Location = New-Object System.Drawing.Point(292, 538)
-    $recycleCheck.Size = New-Object System.Drawing.Size(180, 24)
+    $recycleCheck.Text = "Prefer Recycle Bin"
+    $recycleCheck.Location = New-Object System.Drawing.Point(268, 538)
+    $recycleCheck.Size = New-Object System.Drawing.Size(160, 24)
     $recycleCheck.Checked = $true
     $dialog.Controls.Add($recycleCheck)
 
+    $rogueCheck = New-Object System.Windows.Forms.CheckBox
+    $rogueCheck.Text = "Detect rogue self-protection"
+    $rogueCheck.Location = New-Object System.Drawing.Point(440, 538)
+    $rogueCheck.Size = New-Object System.Drawing.Size(200, 24)
+    $rogueCheck.Checked = $true
+    $dialog.Controls.Add($rogueCheck)
+
+    # Row 2 options
+    $forceCheck = New-Object System.Windows.Forms.CheckBox
+    $forceCheck.Text = "Force delete (use cmd fallback)"
+    $forceCheck.Location = New-Object System.Drawing.Point(24, 564)
+    $forceCheck.Size = New-Object System.Drawing.Size(230, 24)
+    $forceCheck.Checked = $false
+    $forceCheck.ForeColor = $script:DangerColor
+    $dialog.Controls.Add($forceCheck)
+
     $reportLabel = New-Object System.Windows.Forms.Label
-    $reportLabel.Text = "A TXT and JSON report will be generated automatically after execution."
-    $reportLabel.Location = New-Object System.Drawing.Point(24, 566)
-    $reportLabel.Size = New-Object System.Drawing.Size(420, 20)
+    $reportLabel.Text = "A TXT and JSON report will be generated after execution."
+    $reportLabel.Location = New-Object System.Drawing.Point(268, 568)
+    $reportLabel.Size = New-Object System.Drawing.Size(360, 20)
     $reportLabel.ForeColor = $script:MutedColor
     $dialog.Controls.Add($reportLabel)
 
@@ -1218,8 +1497,8 @@ function Show-ExecutionPlannerDialog {
 
     $btnConfirm = New-Object System.Windows.Forms.Button
     $btnConfirm.Text = "Execute"
-    $btnConfirm.Location = New-Object System.Drawing.Point(846, 566)
-    $btnConfirm.Size = New-Object System.Drawing.Size(110, 32)
+    $btnConfirm.Location = New-Object System.Drawing.Point(846, 600)
+    $btnConfirm.Size = New-Object System.Drawing.Size(110, 36)
     $btnConfirm.BackColor = $script:DangerColor
     $btnConfirm.ForeColor = [System.Drawing.Color]::White
     $btnConfirm.FlatStyle = "Flat"
@@ -1227,8 +1506,8 @@ function Show-ExecutionPlannerDialog {
 
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text = "Cancel"
-    $btnCancel.Location = New-Object System.Drawing.Point(846, 604)
-    $btnCancel.Size = New-Object System.Drawing.Size(110, 24)
+    $btnCancel.Location = New-Object System.Drawing.Point(742, 612)
+    $btnCancel.Size = New-Object System.Drawing.Size(90, 24)
     $btnCancel.FlatStyle = "Flat"
     $btnCancel.Add_Click({
         $dialog.Tag = $null
@@ -1254,10 +1533,24 @@ function Show-ExecutionPlannerDialog {
             return
         }
 
+        if ($forceCheck.Checked -and -not $recycleCheck.Checked) {
+            $confirm = [System.Windows.Forms.MessageBox]::Show(
+                "Force delete with permanent deletion is enabled.`r`nFiles will NOT go to the Recycle Bin and may not be recoverable.`r`n`r`nAre you sure?",
+                "Confirm Force Delete",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) {
+                return
+            }
+        }
+
         $dialog.Tag = [pscustomobject]@{
             SelectedCandidates = $selected
-            CreateBackup = $backupCheck.Checked
-            UseRecycleBin = $recycleCheck.Checked
+            CreateBackup       = $backupCheck.Checked
+            UseRecycleBin      = $recycleCheck.Checked
+            ForceRemove        = $forceCheck.Checked
+            DetectRogueware    = $rogueCheck.Checked
         }
         $dialog.Close()
     })
@@ -1272,6 +1565,8 @@ function Invoke-ReviewedDeletion {
         [object[]]$SelectedCandidates,
         [bool]$CreateBackup,
         [bool]$UseRecycleBin,
+        [bool]$ForceRemove = $false,
+        [bool]$DetectRogueware = $true,
         [int]$BlockedCount,
         [System.Windows.Forms.TextBox]$LogBox,
         [System.Windows.Forms.ProgressBar]$ProgressBar,
@@ -1299,12 +1594,11 @@ function Invoke-ReviewedDeletion {
 
     $entries = @()
     $deletionModeLabel = "Permanent Delete"
-    if ($UseRecycleBin) {
-        $deletionModeLabel = "Recycle Bin"
-    }
+    if ($UseRecycleBin) { $deletionModeLabel = "Recycle Bin" }
+    if ($ForceRemove)   { $deletionModeLabel += " + Force" }
 
     Set-ProgressState -ProgressBar $ProgressBar -StatusLabel $StatusLabel -ActivityLabel $ActivityLabel -StatusText "Phase Two Running" -ActivityText "Initializing execution plan..." -Mode Step -Current 0 -Maximum $SelectedCandidates.Count
-    Write-UiLog -LogBox $LogBox -Message "Phase two started: $($SelectedCandidates.Count) selected item(s), deletion mode $deletionModeLabel."
+    Write-UiLog -LogBox $LogBox -Message "Phase two started: $($SelectedCandidates.Count) selected item(s), mode: $deletionModeLabel, rogue detection: $DetectRogueware."
 
     for ($i = 0; $i -lt $SelectedCandidates.Count; $i++) {
         $candidate = $SelectedCandidates[$i]
@@ -1314,6 +1608,7 @@ function Invoke-ReviewedDeletion {
         $candidate.BlockReason = $guard.Reason
 
         Set-ProgressState -ProgressBar $ProgressBar -StatusLabel $StatusLabel -ActivityLabel $ActivityLabel -StatusText "Processing: $($i + 1) / $($SelectedCandidates.Count)" -ActivityText "Working on: $(Get-ShortDisplayPath -Path $candidate.Path)" -Mode Step -Current ($i + 1) -Maximum $SelectedCandidates.Count
+        Write-UiLog -LogBox $LogBox -Message "--- [$($i + 1)/$($SelectedCandidates.Count)] $($candidate.Path)"
 
         if ($candidate.Blocked) {
             $entries += [pscustomobject]@{
@@ -1324,7 +1619,7 @@ function Invoke-ReviewedDeletion {
                 Message = $candidate.BlockReason
                 BackupPath = ""
             }
-            Write-UiLog -LogBox $LogBox -Message "Blocked: $($candidate.Path) ($($candidate.BlockReason))"
+            Write-UiLog -LogBox $LogBox -Message "  BLOCKED: $($candidate.BlockReason)"
             continue
         }
 
@@ -1337,7 +1632,7 @@ function Invoke-ReviewedDeletion {
                 Message = "Path does not exist"
                 BackupPath = ""
             }
-            Write-UiLog -LogBox $LogBox -Message "Skipped: $($candidate.Path) (path does not exist)"
+            Write-UiLog -LogBox $LogBox -Message "  SKIPPED: path does not exist"
             continue
         }
 
@@ -1345,26 +1640,37 @@ function Invoke-ReviewedDeletion {
         try {
             if ($CreateBackup) {
                 $backupPath = Backup-Target -Candidate $candidate -SessionBackupPath $sessionBackupPath -Index ($i + 1)
-                Write-UiLog -LogBox $LogBox -Message "Backed up: $($candidate.Path) -> $backupPath"
+                Write-UiLog -LogBox $LogBox -Message "  Backed up to: $backupPath"
             }
 
-            Stop-TargetProcessIfNeeded -Candidate $candidate
-            Remove-TargetWithMode -Candidate $candidate -UseRecycleBin $UseRecycleBin
+            $deleteResult = Remove-TargetWithFallback `
+                -Candidate $candidate `
+                -UseRecycleBin $UseRecycleBin `
+                -ForceRemove $ForceRemove `
+                -DetectRogueware $DetectRogueware `
+                -LogBox $LogBox
 
-            $resultMessage = "Permanently deleted"
-            if ($UseRecycleBin) {
-                $resultMessage = "Moved to Recycle Bin"
+            if ($deleteResult.Success) {
+                $entries += [pscustomobject]@{
+                    Path = $candidate.Path
+                    SourceLabel = $candidate.SourceLabel
+                    CategoryLabel = $candidate.CategoryLabel
+                    Result = "Success"
+                    Message = $deleteResult.Message
+                    BackupPath = $backupPath
+                }
+                Write-UiLog -LogBox $LogBox -Message "  SUCCESS: $($deleteResult.Message)"
+            } else {
+                $entries += [pscustomobject]@{
+                    Path = $candidate.Path
+                    SourceLabel = $candidate.SourceLabel
+                    CategoryLabel = $candidate.CategoryLabel
+                    Result = "Failed"
+                    Message = $deleteResult.Message
+                    BackupPath = $backupPath
+                }
+                Write-UiLog -LogBox $LogBox -Message "  FAILED: $($deleteResult.Message)"
             }
-
-            $entries += [pscustomobject]@{
-                Path = $candidate.Path
-                SourceLabel = $candidate.SourceLabel
-                CategoryLabel = $candidate.CategoryLabel
-                Result = "Success"
-                Message = $resultMessage
-                BackupPath = $backupPath
-            }
-            Write-UiLog -LogBox $LogBox -Message "Processed: $($candidate.Path)"
         } catch {
             $entries += [pscustomobject]@{
                 Path = $candidate.Path
@@ -1374,7 +1680,7 @@ function Invoke-ReviewedDeletion {
                 Message = $_.Exception.Message
                 BackupPath = $backupPath
             }
-            Write-UiLog -LogBox $LogBox -Message "Skipped: $($candidate.Path) ($($_.Exception.Message))"
+            Write-UiLog -LogBox $LogBox -Message "  EXCEPTION: $($_.Exception.Message)"
         }
     }
 
@@ -1382,12 +1688,13 @@ function Invoke-ReviewedDeletion {
     $report = Save-DeletionReport -SessionId $sessionId -ReviewSnapshotPath $script:ReviewFilePath -BackupPath $sessionBackupPath -UseRecycleBin $UseRecycleBin -Entries $entries -BlockedCount $BlockedCount
 
     $successCount = @($entries | Where-Object { $_.Result -eq "Success" }).Count
-    $skippedCount = @($entries | Where-Object { $_.Result -ne "Success" }).Count
+    $failedCount  = @($entries | Where-Object { $_.Result -eq "Failed" }).Count
+    $skippedCount = @($entries | Where-Object { $_.Result -notin @("Success", "Failed") }).Count
 
     Start-Process "notepad.exe" -ArgumentList $report.TextPath | Out-Null
     Set-ProgressState -ProgressBar $ProgressBar -StatusLabel $StatusLabel -ActivityLabel $ActivityLabel -StatusText "Phase Two Complete" -ActivityText "Report created: $(Get-ShortDisplayPath -Path $report.TextPath)" -Mode Idle
     [System.Windows.Forms.MessageBox]::Show(
-        "Phase two is complete.`r`nSucceeded: $successCount`r`nSkipped / Not Executed: $skippedCount`r`n`r`nReport: $($report.TextPath)",
+        "Phase two is complete.`r`nSucceeded: $successCount`r`nFailed: $failedCount`r`nSkipped / Not Executed: $skippedCount`r`n`r`nReport: $($report.TextPath)",
         "Execution Complete",
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information
@@ -1722,7 +2029,7 @@ $btnPhase2.Add_Click({
         }
 
         Set-UiBusyState -Form $form -IsBusy $true
-        Invoke-ReviewedDeletion -SelectedCandidates $plan.SelectedCandidates -CreateBackup $plan.CreateBackup -UseRecycleBin $plan.UseRecycleBin -BlockedCount $resolution.Blocked.Count -LogBox $logBox -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel
+        Invoke-ReviewedDeletion -SelectedCandidates $plan.SelectedCandidates -CreateBackup $plan.CreateBackup -UseRecycleBin $plan.UseRecycleBin -ForceRemove $plan.ForceRemove -DetectRogueware $plan.DetectRogueware -BlockedCount $resolution.Blocked.Count -LogBox $logBox -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel
     } catch {
         Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase Two Failed" -ActivityText "Interrupted: $($_.Exception.Message)" -Mode Idle
         Write-UiLog -LogBox $logBox -Message "Phase two failed: $($_.Exception.Message)"
