@@ -179,6 +179,8 @@ function Get-PathGuard {
         (Join-Path $env:ProgramData "Microsoft\Windows")
     ) | Where-Object { $_ } | ForEach-Object { Get-NormalizedPath -Path $_ }
 
+    # Both $normalized and $systemDriveRoot are produced by Get-NormalizedPath, which trims trailing
+    # backslashes and lowercases. The comparison is therefore consistently normalized on both sides.
     if ($normalized -eq $systemDriveRoot) {
         return [pscustomobject]@{
             Blocked = $true
@@ -998,19 +1000,24 @@ function Remove-TargetWithMode {
     $item = Get-Item -LiteralPath $Candidate.Path -Force -ErrorAction Stop
 
     if (-not $item.PSIsContainer) {
+        $stream = $null
         try {
+            # Briefly open the file exclusively to verify it is not locked by another process.
             $stream = [System.IO.File]::Open($item.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
-            $stream.Close()
-            $stream.Dispose()
         } catch [System.IO.IOException] {
             throw "File is locked or in use and cannot be deleted: $($item.FullName)"
+        } finally {
+            if ($stream) {
+                $stream.Close()
+                $stream.Dispose()
+            }
         }
     }
 
     if ($UseRecycleBin) {
-        $maxRetries = 2
+        $retryCount = 2  # Total attempts = 1 initial + $retryCount retries
         $lastError = $null
-        for ($attempt = 0; $attempt -le $maxRetries; $attempt++) {
+        for ($attempt = 0; $attempt -le $retryCount; $attempt++) {
             try {
                 if ($item.PSIsContainer) {
                     [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory(
@@ -1028,7 +1035,7 @@ function Remove-TargetWithMode {
                 return
             } catch {
                 $lastError = $_
-                if ($attempt -lt $maxRetries) {
+                if ($attempt -lt $retryCount) {
                     Start-Sleep -Milliseconds 500
                 }
             }
@@ -1593,7 +1600,7 @@ $statusCard.Controls.Add($btnRefresh)
 $progressLabel = New-Object System.Windows.Forms.Label
 $progressLabel.Text = "Waiting"
 $progressLabel.Location = New-Object System.Drawing.Point(666, 60)
-$progressLabel.Size = New-Object System.Drawing.Size(118, 20)
+$progressLabel.Size = New-Object System.Drawing.Size(238, 20)
 $progressLabel.ForeColor = $script:MutedColor
 $statusCard.Controls.Add($progressLabel)
 
