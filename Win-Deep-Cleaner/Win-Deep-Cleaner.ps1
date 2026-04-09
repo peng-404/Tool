@@ -22,6 +22,8 @@ $script:ManifestPath = Join-Path $script:DesktopPath "AI-Review-Metadata.json"
 $script:ReportRoot = Join-Path $script:DesktopPath "Win-Deep-Cleaner-Reports"
 $script:BackupRoot = Join-Path $script:DesktopPath "Win-Deep-Cleaner-Backups"
 
+$script:CancelRequested = $false
+
 $script:AccentColor = [System.Drawing.Color]::FromArgb(34, 87, 74)
 $script:DangerColor = [System.Drawing.Color]::FromArgb(136, 32, 32)
 $script:CanvasColor = [System.Drawing.Color]::FromArgb(245, 240, 231)
@@ -66,11 +68,16 @@ function Set-TaggedControlsState {
 function Set-UiBusyState {
     param(
         [System.Windows.Forms.Form]$Form,
-        [bool]$IsBusy
+        [bool]$IsBusy,
+        [System.Windows.Forms.Button]$CancelButton = $null
     )
 
     $Form.UseWaitCursor = $IsBusy
     Set-TaggedControlsState -Parent $Form -Enabled (-not $IsBusy)
+    if ($CancelButton) {
+        $CancelButton.Visible = $IsBusy
+        $CancelButton.Enabled = $IsBusy
+    }
     [System.Windows.Forms.Application]::DoEvents()
 }
 
@@ -172,14 +179,7 @@ function Get-PathGuard {
         (Join-Path $env:ProgramData "Microsoft\Windows")
     ) | Where-Object { $_ } | ForEach-Object { Get-NormalizedPath -Path $_ }
 
-    if ($normalized -eq (Get-NormalizedPath -Path $env:SystemDrive)) {
-        return [pscustomobject]@{
-            Blocked = $true
-            Reason = "System drive root is blocked"
-        }
-    }
-
-    if ($normalized -eq $systemDriveRoot.TrimEnd('\').ToLowerInvariant()) {
+    if ($normalized -eq $systemDriveRoot) {
         return [pscustomobject]@{
             Blocked = $true
             Reason = "System drive root is blocked"
@@ -464,11 +464,19 @@ function Get-RecursiveFileItems {
     })
 
     while ($stack.Count -gt 0) {
+        if ($script:CancelRequested) {
+            break
+        }
+
         $current = $stack[$stack.Count - 1]
         $stack.RemoveAt($stack.Count - 1)
 
         try {
             $children = Get-ChildItem -LiteralPath $current.Path -Force -ErrorAction Stop
+        } catch [System.UnauthorizedAccessException] {
+            continue
+        } catch [System.IO.IOException] {
+            continue
         } catch {
             continue
         }
@@ -988,20 +996,44 @@ function Remove-TargetWithMode {
     )
 
     $item = Get-Item -LiteralPath $Candidate.Path -Force -ErrorAction Stop
-    if ($UseRecycleBin) {
-        if ($item.PSIsContainer) {
-            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory(
-                $item.FullName,
-                [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
-                [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
-            )
-        } else {
-            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
-                $item.FullName,
-                [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
-                [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
-            )
+
+    if (-not $item.PSIsContainer) {
+        try {
+            $stream = [System.IO.File]::Open($item.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            $stream.Close()
+            $stream.Dispose()
+        } catch [System.IO.IOException] {
+            throw "File is locked or in use and cannot be deleted: $($item.FullName)"
         }
+    }
+
+    if ($UseRecycleBin) {
+        $maxRetries = 2
+        $lastError = $null
+        for ($attempt = 0; $attempt -le $maxRetries; $attempt++) {
+            try {
+                if ($item.PSIsContainer) {
+                    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory(
+                        $item.FullName,
+                        [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+                        [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
+                    )
+                } else {
+                    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
+                        $item.FullName,
+                        [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+                        [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
+                    )
+                }
+                return
+            } catch {
+                $lastError = $_
+                if ($attempt -lt $maxRetries) {
+                    Start-Sleep -Milliseconds 500
+                }
+            }
+        }
+        throw $lastError
     } else {
         Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
     }
@@ -1307,6 +1339,11 @@ function Invoke-ReviewedDeletion {
     Write-UiLog -LogBox $LogBox -Message "Phase two started: $($SelectedCandidates.Count) selected item(s), deletion mode $deletionModeLabel."
 
     for ($i = 0; $i -lt $SelectedCandidates.Count; $i++) {
+        if ($script:CancelRequested) {
+            Write-UiLog -LogBox $LogBox -Message "Operation cancelled by user after $i item(s)."
+            break
+        }
+
         $candidate = $SelectedCandidates[$i]
         $candidate.ExistsNow = Test-Path -LiteralPath $candidate.Path
         $guard = Get-PathGuard -Path $candidate.Path
@@ -1378,16 +1415,19 @@ function Invoke-ReviewedDeletion {
         }
     }
 
-    Set-ProgressState -ProgressBar $ProgressBar -StatusLabel $StatusLabel -ActivityLabel $ActivityLabel -StatusText "Phase Two Complete" -ActivityText "Generating execution report..." -Mode Step -Current $SelectedCandidates.Count -Maximum $SelectedCandidates.Count
+    $wasCancelled = $script:CancelRequested
+    $completionStatus = if ($wasCancelled) { "Phase Two Cancelled" } else { "Phase Two Complete" }
+    Set-ProgressState -ProgressBar $ProgressBar -StatusLabel $StatusLabel -ActivityLabel $ActivityLabel -StatusText $completionStatus -ActivityText "Generating execution report..." -Mode Step -Current $SelectedCandidates.Count -Maximum $SelectedCandidates.Count
     $report = Save-DeletionReport -SessionId $sessionId -ReviewSnapshotPath $script:ReviewFilePath -BackupPath $sessionBackupPath -UseRecycleBin $UseRecycleBin -Entries $entries -BlockedCount $BlockedCount
 
     $successCount = @($entries | Where-Object { $_.Result -eq "Success" }).Count
     $skippedCount = @($entries | Where-Object { $_.Result -ne "Success" }).Count
 
     Start-Process "notepad.exe" -ArgumentList $report.TextPath | Out-Null
-    Set-ProgressState -ProgressBar $ProgressBar -StatusLabel $StatusLabel -ActivityLabel $ActivityLabel -StatusText "Phase Two Complete" -ActivityText "Report created: $(Get-ShortDisplayPath -Path $report.TextPath)" -Mode Idle
+    Set-ProgressState -ProgressBar $ProgressBar -StatusLabel $StatusLabel -ActivityLabel $ActivityLabel -StatusText $completionStatus -ActivityText "Report created: $(Get-ShortDisplayPath -Path $report.TextPath)" -Mode Idle
+    $summaryPrefix = if ($wasCancelled) { "Phase two was cancelled early." } else { "Phase two is complete." }
     [System.Windows.Forms.MessageBox]::Show(
-        "Phase two is complete.`r`nSucceeded: $successCount`r`nSkipped / Not Executed: $skippedCount`r`n`r`nReport: $($report.TextPath)",
+        "$summaryPrefix`r`nSucceeded: $successCount`r`nSkipped / Not Executed: $skippedCount`r`n`r`nReport: $($report.TextPath)",
         "Execution Complete",
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information
@@ -1553,9 +1593,26 @@ $statusCard.Controls.Add($btnRefresh)
 $progressLabel = New-Object System.Windows.Forms.Label
 $progressLabel.Text = "Waiting"
 $progressLabel.Location = New-Object System.Drawing.Point(666, 60)
-$progressLabel.Size = New-Object System.Drawing.Size(238, 20)
+$progressLabel.Size = New-Object System.Drawing.Size(118, 20)
 $progressLabel.ForeColor = $script:MutedColor
 $statusCard.Controls.Add($progressLabel)
+
+$btnCancelOperation = New-Object System.Windows.Forms.Button
+$btnCancelOperation.Text = "Cancel"
+$btnCancelOperation.Location = New-Object System.Drawing.Point(796, 56)
+$btnCancelOperation.Size = New-Object System.Drawing.Size(108, 28)
+$btnCancelOperation.BackColor = [System.Drawing.Color]::FromArgb(180, 60, 60)
+$btnCancelOperation.ForeColor = [System.Drawing.Color]::White
+$btnCancelOperation.FlatStyle = "Flat"
+$btnCancelOperation.Visible = $false
+$btnCancelOperation.Enabled = $false
+$btnCancelOperation.Add_Click({
+    $script:CancelRequested = $true
+    $btnCancelOperation.Enabled = $false
+    $btnCancelOperation.Text = "Cancelling..."
+    Write-UiLog -LogBox $logBox -Message "Cancel requested. Stopping after current item completes..."
+})
+$statusCard.Controls.Add($btnCancelOperation)
 
 $progressBar = New-Object System.Windows.Forms.ProgressBar
 $progressBar.Location = New-Object System.Drawing.Point(18, 72)
@@ -1597,8 +1654,10 @@ $logCard.Controls.Add($logBox)
 
 $btnPhase1.Add_Click({
     try {
+        $script:CancelRequested = $false
+        $btnCancelOperation.Text = "Cancel"
         $phase1TotalSteps = 7
-        Set-UiBusyState -Form $form -IsBusy $true
+        Set-UiBusyState -Form $form -IsBusy $true -CancelButton $btnCancelOperation
         Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Preparing phase one..." -Mode Step -Current 0 -Maximum $phase1TotalSteps
         Write-UiLog -LogBox $logBox -Message "Phase one started: running system cleanup and scanning safe user areas for cleanup and suspicious candidates."
 
@@ -1634,20 +1693,25 @@ $btnPhase1.Add_Click({
         Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Running" -ActivityText "Step 7/${phase1TotalSteps}: creating review file and metadata..." -Mode Marquee
         $artifactInfo = Save-ReviewArtifacts -Candidates $allCandidates
 
-        Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Complete" -ActivityText "Review list created with $($artifactInfo.SafeCandidates.Count) candidate(s)." -Mode Idle
-        Update-ReviewStatus -Label $reviewPathLabel -OpenButton $btnOpenReview -Phase2Button $btnPhase2
+        if ($script:CancelRequested) {
+            Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Cancelled" -ActivityText "Scan cancelled. Partial results may have been saved." -Mode Idle
+            Write-UiLog -LogBox $logBox -Message "Phase one cancelled by user."
+        } else {
+            Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Complete" -ActivityText "Review list created with $($artifactInfo.SafeCandidates.Count) candidate(s)." -Mode Idle
+            Update-ReviewStatus -Label $reviewPathLabel -OpenButton $btnOpenReview -Phase2Button $btnPhase2
 
-        Write-UiLog -LogBox $logBox -Message "Phase one complete: $($artifactInfo.SafeCandidates.Count) reviewable candidate(s), $($artifactInfo.BlockedCandidates.Count) high-risk path(s) blocked."
-        Write-UiLog -LogBox $logBox -Message "Review file: $script:ReviewFilePath"
-        Write-UiLog -LogBox $logBox -Message "Metadata file: $script:ManifestPath"
-        Start-Process "notepad.exe" -ArgumentList $script:ReviewFilePath | Out-Null
+            Write-UiLog -LogBox $logBox -Message "Phase one complete: $($artifactInfo.SafeCandidates.Count) reviewable candidate(s), $($artifactInfo.BlockedCandidates.Count) high-risk path(s) blocked."
+            Write-UiLog -LogBox $logBox -Message "Review file: $script:ReviewFilePath"
+            Write-UiLog -LogBox $logBox -Message "Metadata file: $script:ManifestPath"
+            Start-Process "notepad.exe" -ArgumentList $script:ReviewFilePath | Out-Null
 
-        [System.Windows.Forms.MessageBox]::Show(
-            "Phase one is complete.`r`n`r`n1. The review TXT and metadata file were created on the Desktop.`r`n2. Candidates may include cleanup items and suspicious items.`r`n3. Suspicious items are heuristic findings, not a malware verdict.`r`n4. Save the TXT, then return to the main window and start phase two.",
-            "Phase One Complete",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Information
-        ) | Out-Null
+            [System.Windows.Forms.MessageBox]::Show(
+                "Phase one is complete.`r`n`r`n1. The review TXT and metadata file were created on the Desktop.`r`n2. Candidates may include cleanup items and suspicious items.`r`n3. Suspicious items are heuristic findings, not a malware verdict.`r`n4. Save the TXT, then return to the main window and start phase two.",
+                "Phase One Complete",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            ) | Out-Null
+        }
     } catch {
         Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase One Failed" -ActivityText "Interrupted: $($_.Exception.Message)" -Mode Idle
         Write-UiLog -LogBox $logBox -Message "Phase one failed: $($_.Exception.Message)"
@@ -1658,7 +1722,7 @@ $btnPhase1.Add_Click({
             [System.Windows.Forms.MessageBoxIcon]::Error
         ) | Out-Null
     } finally {
-        Set-UiBusyState -Form $form -IsBusy $false
+        Set-UiBusyState -Form $form -IsBusy $false -CancelButton $btnCancelOperation
         Update-ReviewStatus -Label $reviewPathLabel -OpenButton $btnOpenReview -Phase2Button $btnPhase2
     }
 })
@@ -1685,6 +1749,8 @@ $btnRefresh.Add_Click({
 
 $btnPhase2.Add_Click({
     try {
+        $script:CancelRequested = $false
+        $btnCancelOperation.Text = "Cancel"
         Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Preparing Phase Two" -ActivityText "Reading the review file..." -Mode Marquee
         $reviewedPaths = Get-ReviewedPaths
         if ($reviewedPaths.Count -eq 0) {
@@ -1721,7 +1787,7 @@ $btnPhase2.Add_Click({
             return
         }
 
-        Set-UiBusyState -Form $form -IsBusy $true
+        Set-UiBusyState -Form $form -IsBusy $true -CancelButton $btnCancelOperation
         Invoke-ReviewedDeletion -SelectedCandidates $plan.SelectedCandidates -CreateBackup $plan.CreateBackup -UseRecycleBin $plan.UseRecycleBin -BlockedCount $resolution.Blocked.Count -LogBox $logBox -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel
     } catch {
         Set-ProgressState -ProgressBar $progressBar -StatusLabel $progressLabel -ActivityLabel $activityLabel -StatusText "Phase Two Failed" -ActivityText "Interrupted: $($_.Exception.Message)" -Mode Idle
@@ -1733,7 +1799,7 @@ $btnPhase2.Add_Click({
             [System.Windows.Forms.MessageBoxIcon]::Error
         ) | Out-Null
     } finally {
-        Set-UiBusyState -Form $form -IsBusy $false
+        Set-UiBusyState -Form $form -IsBusy $false -CancelButton $btnCancelOperation
         Update-ReviewStatus -Label $reviewPathLabel -OpenButton $btnOpenReview -Phase2Button $btnPhase2
     }
 })
